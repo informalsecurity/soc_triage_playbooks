@@ -1,0 +1,189 @@
+{
+  "id": "proc-logon-from-risky-ip",
+  "title": "Logon from a Risky IP Address",
+  "version": "1.0",
+  "detectionType": "Identity / Activity policy — risky IP logon",
+  "severityDefault": "medium",
+  "description": "An activity policy flagged an authentication originating from an IP address with poor reputation (anonymizer, hosting, blocklisted, or otherwise risky). 'Risky' is a reputation label, not a verdict. The triage question is whether this authentication was performed by the legitimate user; a risky IP has many benign explanations (VPN, Tor, mobile CGNAT, travel, cloud workspace, freshly-relisted address) as well as malicious ones (account takeover from anonymized infrastructure).",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "Confirm this is a new alert (not a duplicate of an open case) and record the identifiers you will reason about throughout.\n\n- Note the identity: user principal / account, role, and typical work location/timezone.\n- Note the source IP, plus the geolocation, ASN, and hosting/organization the IP resolves to.\n- Note the authentication outcome: success, failure, or success-after-failures.\n- Note the target application/resource and the authentication method (password, MFA, token, legacy protocol).\n- Record the event timestamp and the reporting identity source.",
+      "evidence": [
+        {"id": "user", "label": "Identity (account / role / normal location)", "type": "textarea"},
+        {"id": "ip", "label": "Source IP (geo / ASN / org)", "type": "textarea"},
+        {"id": "outcome", "label": "Auth outcome (success / fail / after-failures)", "type": "text"},
+        {"id": "target", "label": "Target app & auth method", "type": "text"},
+        {"id": "time", "label": "Event time & identity source", "type": "text"}
+      ],
+      "next": "enrich-ip"
+    },
+
+    "enrich-ip": {
+      "type": "step",
+      "title": "Characterize the risky IP",
+      "instructions": "Establish WHY the IP is considered risky, because the reason changes how much weight it carries.\n\n- Gather reputation from a threat-intel capability: is it flagged for anonymization (VPN/proxy/Tor), hosting/datacenter, brute-force/scanning, malware C2, or spam?\n- Classify the IP type: residential ISP, mobile/cellular (carrier-grade NAT), commercial VPN, cloud/hosting provider, Tor exit node, or corporate egress.\n- Check the age/recency of the risk listing: a freshly-listed address may reflect a prior unrelated tenant on a recycled/dynamic IP.\n- Determine whether this IP or ASN is one your organization or users legitimately use (corporate VPN egress, sanctioned cloud workspace, known jumpbox).",
+      "evidence": [
+        {"id": "why-risky", "label": "Why is it risky? (anonymizer / hosting / scanner / C2 ...)", "type": "textarea"},
+        {"id": "ip-type", "label": "IP type (residential / mobile / VPN / hosting / Tor / corp)", "type": "text"},
+        {"id": "listing-age", "label": "Listing recency / recycled-IP indication", "type": "text"},
+        {"id": "org-known", "label": "Is this IP/ASN legitimately used by us?", "type": "text"}
+      ],
+      "next": "auth-success?"
+    },
+
+    "auth-success?": {
+      "type": "decision",
+      "title": "Did the authentication actually succeed?",
+      "instructions": "A failed logon from a risky IP is exposure/noise; a successful one is a potential account takeover. Route accordingly. 'Success after failures' counts as success and is itself a suspicious pattern to carry forward.",
+      "options": [
+        {"label": "Succeeded (including success-after-failures)", "next": "user-context", "note": "Potential account access — investigate fully."},
+        {"label": "Failed — no successful session established", "next": "failed-branch", "note": "Attempted access only; assess pattern and exposure."}
+      ]
+    },
+
+    "failed-branch": {
+      "type": "step",
+      "title": "Assess the failed-authentication pattern",
+      "instructions": "No session was established, but the attempt still tells you something about targeting.\n\n- Determine volume and cadence: a single failure vs. repeated attempts (password spray / brute force / credential stuffing).\n- Check whether the same source IP or ASN targeted other accounts in the same window (spray indicator).\n- Determine why it failed: wrong password, MFA not satisfied, or conditional-access/policy block — MFA/policy blocking a correct password is more concerning than a wrong password.\n- Check whether the account is showing signs of being targeted (prior lockouts, recent password sprays).",
+      "evidence": [
+        {"id": "volume", "label": "Attempt volume & cadence", "type": "textarea"},
+        {"id": "spread", "label": "Other accounts hit from same IP/ASN?", "type": "text"},
+        {"id": "fail-reason", "label": "Failure reason (bad pw / MFA / policy block)", "type": "text"}
+      ],
+      "next": "failed-verdict?"
+    },
+
+    "failed-verdict?": {
+      "type": "decision",
+      "title": "Does the failed attempt warrant protective action?",
+      "instructions": "Decide whether this is background noise to close, or a targeting pattern that justifies hardening even though no compromise occurred.",
+      "options": [
+        {"label": "Targeting pattern (spray / brute force / repeated)", "next": "harden-close", "note": "No breach, but the account/IP warrants action."},
+        {"label": "Isolated / benign failed attempt", "next": "close-fp-failed", "note": "Single or low-signal failure; close as noise."}
+      ]
+    },
+
+    "user-context": {
+      "type": "step",
+      "title": "Establish the legitimate-user baseline",
+      "instructions": "The session succeeded. Determine whether the legitimate user could plausibly be behind this IP. Work these benign explanations explicitly.\n\n- Travel: is the user known/expected to be traveling, and is the geolocation consistent with plausible travel from their last known location (vs. impossible travel)?\n- VPN/privacy tools: does the user use a corporate VPN, a commercial VPN, or Tor that would legitimately egress from a risky/anonymized IP?\n- Connection type: could this be mobile/cellular (CGNAT) or a cloud workspace / RDP jumpbox / VDI that legitimately presents a hosting IP?\n- Device & session: is the device known/managed and previously seen for this user? Was MFA satisfied by a legitimate factor, or was there MFA fatigue (repeated prompts) before approval?\n- Concurrency: are there simultaneous sessions from the user's normal location AND the risky IP (a strong takeover signal)?",
+      "evidence": [
+        {"id": "travel", "label": "Travel / impossible-travel assessment", "type": "textarea"},
+        {"id": "vpn", "label": "Known VPN / Tor / privacy-tool use by user", "type": "textarea"},
+        {"id": "conn-type", "label": "Mobile CGNAT / cloud workspace / VDI explanation?", "type": "textarea"},
+        {"id": "device-mfa", "label": "Device familiarity & MFA (satisfied? fatigue?)", "type": "textarea"},
+        {"id": "concurrency", "label": "Concurrent sessions from other locations?", "type": "text"}
+      ],
+      "next": "post-login"
+    },
+
+    "post-login": {
+      "type": "step",
+      "title": "Review post-authentication session behavior",
+      "instructions": "Behavior after login separates a benign-but-risky IP from an active takeover, even when context is ambiguous.\n\n- Review actions taken in the session: mailbox rule creation/forwarding, mass file access/download, permission or MFA-method changes, OAuth app consent grants.\n- Check for identity-persistence moves: new MFA device registered, password change, recovery info altered.\n- Assess whether the activity matches the user's normal behavior and role, or is anomalous in type, volume, or timing.\n- Confirm the user's account of the activity where feasible (did they actually log in from this location/tool?).",
+      "evidence": [
+        {"id": "actions", "label": "Session actions (rules / downloads / consents)", "type": "textarea"},
+        {"id": "persistence", "label": "Identity-persistence changes (MFA / pw / recovery)", "type": "textarea"},
+        {"id": "user-confirm", "label": "User confirmation of the logon", "type": "textarea"}
+      ],
+      "next": "verdict?"
+    },
+
+    "verdict?": {
+      "type": "decision",
+      "title": "What is the verdict on the successful logon?",
+      "instructions": "Weigh IP nature, user baseline, and session behavior together. Confirmed benign explanation + normal behavior = false positive. Impossible travel, unexplained anonymizer, MFA fatigue/anomalous factor, malicious post-login actions, or concurrent sessions = account takeover. If you genuinely cannot resolve it, treat as suspicious and verify with the user out-of-band.",
+      "options": [
+        {"label": "Confirmed account takeover / unauthorized access", "next": "contain-identity", "note": "Malicious behavior or unexplained anonymized access."},
+        {"label": "Legitimate user, benign explanation confirmed", "next": "close-fp-success", "note": "VPN/travel/mobile/cloud explains it; behavior normal."},
+        {"label": "Unresolved — verify with user out-of-band", "next": "user-verify", "note": "Ambiguous; confirm directly before deciding."}
+      ]
+    },
+
+    "user-verify": {
+      "type": "step",
+      "title": "Verify directly with the user (out-of-band)",
+      "instructions": "Ambiguous case. Reach the user through a trusted channel — not by replying to the flagged session or account — to confirm the activity.\n\n- Use a known phone/secondary channel; do not rely on the possibly-compromised account.\n- Ask whether they logged in at that time, from that location, and via any VPN/Tor/mobile/cloud tool.\n- If you cannot reach them promptly and any takeover indicator exists, treat as compromise and contain.",
+      "evidence": [
+        {"id": "verify-channel", "label": "Channel used & who was contacted", "type": "text"},
+        {"id": "verify-result", "label": "User's confirmation / denial", "type": "textarea"}
+      ],
+      "next": "verify-result?"
+    },
+
+    "verify-result?": {
+      "type": "decision",
+      "title": "Did the user confirm the activity as their own?",
+      "instructions": "Route on the user's confirmation. If unreachable with indicators present, choose containment.",
+      "options": [
+        {"label": "User confirms — it was them", "next": "close-fp-success", "note": "Benign; close as false positive."},
+        {"label": "User denies, or unreachable with indicators", "next": "contain-identity", "note": "Treat as compromise."}
+      ]
+    },
+
+    "contain-identity": {
+      "type": "step",
+      "title": "Contain the identity",
+      "instructions": "Credible account takeover. Contain the identity before scoping and handoff.\n\n- Revoke active sessions/tokens for the account and force re-authentication.\n- Reset the password and require a fresh, trusted MFA re-enrollment; remove any attacker-registered MFA methods.\n- Reverse persistence: delete malicious mailbox rules/forwarding, revoke illicit OAuth grants, restore recovery settings.\n- Block or restrict the source IP where appropriate and record every action with timestamps.",
+      "evidence": [
+        {"id": "session-revoke", "label": "Session/token revocation & password reset (time)", "type": "textarea"},
+        {"id": "mfa-fix", "label": "MFA methods removed/re-enrolled", "type": "textarea"},
+        {"id": "persist-removed", "label": "Rules / OAuth grants / recovery reversed", "type": "textarea"}
+      ],
+      "next": "scope-identity",
+      "playbook": "CONTAINMENT"
+    },
+
+    "scope-identity": {
+      "type": "step",
+      "title": "Scope the compromise",
+      "instructions": "Determine what the attacker reached before handoff.\n\n- Build a timeline of the attacker's session(s): first access to latest activity, and everything done in between.\n- Enumerate data accessed, exported, or shared, and any messages sent from the account.\n- Check for lateral movement: other accounts contacted, internal phishing, or shared resources touched.\n- Identify other accounts authenticating from the same IP/ASN (shared-campaign indicator) and whether any secrets/credentials were exposed.",
+      "evidence": [
+        {"id": "timeline", "label": "Attacker session timeline", "type": "textarea"},
+        {"id": "data", "label": "Data accessed / exported / sent", "type": "textarea"},
+        {"id": "lateral", "label": "Lateral movement & other affected accounts", "type": "textarea"}
+      ],
+      "next": "escalate-identity",
+      "playbook": "SCOPING"
+    },
+
+    "escalate-identity": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "Confirmed identity compromise with containment and scope established. Hand off with a complete package.\n\n- Ensure identity, IP characterization, session timeline, data exposure, and containment actions are all recorded above.\n- Assign incident severity per your matrix and notify the on-call IR owner.\n- Preserve identity/audit logs before retention windows expire.\n- Transfer ownership; eradication, further notifications, and recovery proceed under the IR playbook.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Confirmed account takeover via risky-IP logon; identity contained, scoped, and escalated to IR."
+    },
+
+    "harden-close": {
+      "type": "terminal",
+      "title": "Close — failed attempt, protective hardening applied",
+      "instructions": "No compromise occurred, but the account/IP showed a targeting pattern worth acting on.\n\n- Document the pattern (spray/brute force/repeated) and confirm no successful session exists.\n- Apply proportionate hardening: block the source IP/ASN, confirm the account is protected by MFA, and consider a precautionary credential reset if the password may be known.\n- Note whether other targeted accounts need the same treatment.\n- Propose detection tuning if the source is now blocked.",
+      "disposition": "other",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Failed risky-IP logon with targeting pattern; no breach. Source blocked and account hardening applied."
+    },
+
+    "close-fp-failed": {
+      "type": "terminal",
+      "title": "Close — false positive (isolated failed attempt)",
+      "instructions": "An isolated, low-signal failed authentication from a risky IP with no targeting pattern and no session.\n\n- Document that no session was established and no pattern was found.\n- If the IP is a chronically noisy source unrelated to real targeting, propose tuning to reduce recurrence.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Isolated failed logon from a risky IP; no session, no pattern. Closed as false positive."
+    },
+
+    "close-fp-success": {
+      "type": "terminal",
+      "title": "Close — false positive (legitimate user)",
+      "instructions": "The successful logon is explained by legitimate user activity (corporate/commercial VPN, Tor by a privacy-conscious user, travel, mobile CGNAT, or a cloud workspace/VDI), device and behavior are consistent, and the user confirmed where applicable.\n\n- Document the specific benign explanation and the confirming evidence (baseline, device, user confirmation).\n- If this pattern is expected to recur for this user or IP/ASN (e.g. a sanctioned VPN egress), propose scoped tuning/allow-listing so it does not re-alert without cause.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Risky-IP logon explained by legitimate user activity (VPN/travel/mobile/cloud); behavior normal. Closed as false positive."
+    }
+  }
+}
