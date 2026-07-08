@@ -1,0 +1,213 @@
+{
+  "id": "proc-meraki-snort-ids-detection",
+  "title": "Snort IDS Detection",
+  "version": "1.0",
+  "detectionType": "Network IDS/IPS / Meraki Snort — egress malware/C2 signature",
+  "severityDefault": "high",
+  "description": "The Meraki security appliance's Snort engine fired an intrusion signature on traffic from an internal endpoint to an external destination. These alerts are scoped to egress threat signatures only — malware command-and-control, botnet, and similar outbound-threat categories — with inbound probing, PUA, and policy signatures deliberately suppressed. Every alert therefore means an internal host may be communicating with malicious infrastructure. The investigation's central challenge is that Meraki reports a network-level source (often a NAT'd internal IP, MAC, or client name behind the appliance): the analyst must first identify the actual host, then attempt process-level attribution in the endpoint platform (CrowdStrike). A distinct path handles hosts that are NOT in CrowdStrike, where the security team lacks endpoint access and must engage the client's technician, while still acting at the network layer.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture the Snort event",
+      "instructions": "Confirm this is a new alert (not a duplicate) and capture everything the IDS event provides.\n\n- Record the Snort signature: rule name/ID, category (malware CnC, botnet, etc.), and the message text.\n- Record the flow: internal source IP (as seen by the appliance), external destination IP/port/hostname, and protocol.\n- Note whether the appliance action was DETECT (alerted only) or PREVENT (blocked) — this changes urgency and whether the connection actually completed.\n- Record the event timestamp(s) and whether the signature fired once or repeatedly (single hit vs. sustained/periodic).\n- Note which Meraki network/appliance and, if applicable, which client/tenant the alert belongs to.",
+      "evidence": [
+        {"id": "signature", "label": "Snort rule (ID / name / category / message)", "type": "textarea"},
+        {"id": "flow", "label": "Flow: internal src IP → dest IP/host/port/proto", "type": "textarea"},
+        {"id": "action", "label": "Appliance action (DETECT vs PREVENT)", "type": "text"},
+        {"id": "cadence", "label": "Single hit vs. repeated/periodic; timestamps", "type": "textarea"},
+        {"id": "tenant", "label": "Meraki network / client / tenant", "type": "text"}
+      ],
+      "next": "characterize"
+    },
+
+    "characterize": {
+      "type": "step",
+      "title": "Characterize the signature and destination",
+      "instructions": "Establish how credible the threat indicator is before spending effort on host hunting — but note these are already scoped to egress threat categories, so the default posture is suspicion.\n\n- Enrich the external destination (IP and hostname) in a threat-intel capability: known C2, malware distribution, botnet, sinkhole, or clean/miscategorized.\n- Assess the signature's fidelity: is this rule specific to a known malware family/C2 protocol, or a broader heuristic that can trip on legitimate traffic?\n- Determine whether the destination is a known-good service that the signature misfires on (e.g. a legitimate CDN, cloud, or app that resembles C2 patterns).\n- Note whether the same destination or signature is firing for multiple internal hosts (campaign/worm indicator) or just one.",
+      "evidence": [
+        {"id": "dest-intel", "label": "Destination reputation (C2 / malware / clean / miscategorized)", "type": "textarea"},
+        {"id": "sig-fidelity", "label": "Signature fidelity (specific family vs. broad heuristic)", "type": "textarea"},
+        {"id": "spread", "label": "One host or many hitting this dest/signature?", "type": "text"}
+      ],
+      "next": "identify-host"
+    },
+
+    "identify-host": {
+      "type": "step",
+      "title": "Identify the actual host from Meraki data",
+      "instructions": "The appliance reports a network-level source. Resolve it to a specific physical host using everything Meraki knows.\n\n- In the Meraki client/flow data, map the internal source IP at the event timestamp to a client entry: hostname, MAC address, and manufacturer (OUI often reveals device type).\n- Capture connection context: wired switchport or wireless SSID, VLAN, and the assigned/DHCP name, to physically locate the device.\n- Review the client's other flows around the event for corroborating malicious traffic or additional destinations.\n- Beware NAT and DHCP churn: confirm the IP-to-client mapping was valid at the exact event time, not just now. Note the user associated with the device if Meraki or directory data reveals it.\n- Record the strongest device fingerprint you can assemble (hostname + MAC + location + user).",
+      "evidence": [
+        {"id": "client", "label": "Meraki client match (hostname / MAC / OUI / manufacturer)", "type": "textarea"},
+        {"id": "location", "label": "Connection context (switchport / SSID / VLAN / DHCP name)", "type": "textarea"},
+        {"id": "corroborate", "label": "Other suspicious flows from same client", "type": "textarea"},
+        {"id": "user", "label": "Associated user (if known)", "type": "text"}
+      ],
+      "next": "host-identified?"
+    },
+
+    "host-identified?": {
+      "type": "decision",
+      "title": "Were you able to identify a specific host?",
+      "instructions": "Decide whether Meraki data pinned the traffic to a specific device, or whether the source remains ambiguous (stale mapping, no client record, transient/guest device).",
+      "options": [
+        {"label": "Yes — specific host/device identified", "next": "in-edr?", "note": "Attempt process attribution."},
+        {"label": "No — cannot resolve to a specific device", "next": "unresolved-host", "note": "Act at network layer; pursue identification."}
+      ]
+    },
+
+    "in-edr?": {
+      "type": "decision",
+      "title": "Is the identified host managed in the endpoint platform (CrowdStrike)?",
+      "instructions": "This determines whether the security team can perform process-level attribution directly, or must engage the client's technician because it lacks endpoint access to that device.",
+      "options": [
+        {"label": "Yes — host is in CrowdStrike", "next": "edr-investigate", "note": "Security team investigates directly."},
+        {"label": "No — host not in CrowdStrike (no security-team access)", "next": "not-in-edr", "note": "Engage the client's technician."}
+      ]
+    },
+
+    "edr-investigate": {
+      "type": "step",
+      "title": "Investigate the host in CrowdStrike",
+      "instructions": "The host is managed. Pivot from the network flow to process-level attribution around the Snort event timestamps.\n\n- Locate the host in the endpoint platform and search its network telemetry for connections to the flagged destination IP/host/port at the event time.\n- Identify the initiating process for that connection: a browser or known application (possible false positive / user activity), or an unexpected binary (script host, LOLBin, unsigned/renamed executable, temp/user-path) indicating malware the network caught but prevention missed.\n- For any suspicious process, capture path, signature, parent, reputation, persistence, and whether the endpoint platform raised related (possibly lower-severity or suppressed) detections.\n- Determine whether the traffic is autonomous (periodic C2 beaconing) or tied to user action, and whether connections actually succeeded (especially if the appliance was DETECT-only and the connection completed).",
+      "evidence": [
+        {"id": "edr-net", "label": "Matching connection found in EDR telemetry?", "type": "textarea"},
+        {"id": "process", "label": "Initiating process (path / signer / parent / reputation)", "type": "textarea"},
+        {"id": "behavior", "label": "Autonomous beaconing vs. user-driven; connection success", "type": "textarea"},
+        {"id": "edr-related", "label": "Related EDR detections (even suppressed)?", "type": "text"}
+      ],
+      "next": "edr-verdict?"
+    },
+
+    "edr-verdict?": {
+      "type": "decision",
+      "title": "What does the endpoint investigation conclude?",
+      "instructions": "A suspicious process or autonomous beaconing to credible malicious infrastructure confirms infection. A legitimate process reaching a destination the signature misfires on points to a false positive. If evidence is mixed or the connection is unclear, treat as suspicious and confirm.",
+      "options": [
+        {"label": "Confirmed malicious C2 / infection", "next": "contain-host", "note": "Malware the network caught; contain."},
+        {"label": "Benign — legitimate process, signature/dest misfire", "next": "close-fp", "note": "False positive; tune."},
+        {"label": "Inconclusive — needs deeper analysis", "next": "deep-analysis", "note": "Collect more before deciding."}
+      ]
+    },
+
+    "deep-analysis": {
+      "type": "step",
+      "title": "Deepen the endpoint analysis",
+      "instructions": "The initial endpoint review was inconclusive. Collect more before deciding.\n\n- Pull the suspect binary for reputation/sandbox analysis and examine its full behavior (network, persistence, injection, file/registry changes).\n- Extend the timeline: earlier and later activity on the host, other destinations contacted, and any staging or discovery behavior.\n- Correlate with identity/authentication logs for the associated user if account involvement is possible.\n- Where feasible, confirm the activity with the user (did they run/download anything matching the timeframe).",
+      "evidence": [
+        {"id": "sample", "label": "Binary/sandbox analysis results", "type": "textarea"},
+        {"id": "timeline", "label": "Extended host timeline & other destinations", "type": "textarea"},
+        {"id": "user-confirm", "label": "User confirmation of activity", "type": "textarea"}
+      ],
+      "next": "deep-verdict?"
+    },
+
+    "deep-verdict?": {
+      "type": "decision",
+      "title": "After deeper analysis, is this malicious?",
+      "instructions": "Resolve the inconclusive case. Malicious behavior confirmed = infection. Legitimate explanation established = false positive.",
+      "options": [
+        {"label": "Malicious — confirmed infection", "next": "contain-host", "note": "Contain."},
+        {"label": "Benign — legitimate activity confirmed", "next": "close-fp", "note": "False positive; tune."}
+      ]
+    },
+
+    "not-in-edr": {
+      "type": "step",
+      "title": "Host not in CrowdStrike — engage the client technician and act at the network layer",
+      "instructions": "The security team has no endpoint access to this device, so process attribution must be done by the client's technician. Do not treat this as a dead end — act at the network layer immediately and hand off a precise hunt package.\n\n- Take proportionate network-layer protective action now: block/deny the malicious destination on the Meraki appliance (and switch the signature to PREVENT if it was DETECT-only) so the host is denied C2 while it is tracked down.\n- Assemble a hunt package for the client's technician using the fingerprint from Meraki: hostname, MAC, switchport/SSID/VLAN, user, event time, destination, and signature — enough to physically locate the device.\n- Instruct the technician on what to look for once at the host: unexpected running processes/services making the connection, recently installed software, scheduled tasks/persistence, and recent downloads or email attachments around the event time; and to preserve evidence rather than immediately wiping.\n- Request that the technician report findings back, and (if policy allows) that the endpoint be enrolled in the endpoint platform to enable direct investigation.",
+      "evidence": [
+        {"id": "network-block", "label": "Network-layer action (dest block / DETECT→PREVENT) & time", "type": "textarea"},
+        {"id": "handoff", "label": "Hunt package sent to technician (fingerprint + what to check)", "type": "textarea"},
+        {"id": "tech-contact", "label": "Technician engaged (who / when / channel)", "type": "text"}
+      ],
+      "next": "tech-findings?"
+    },
+
+    "tech-findings?": {
+      "type": "decision",
+      "title": "What did the client technician find at the host?",
+      "instructions": "Route on the technician's report. Confirmed malicious artifacts = infection to escalate. A clear benign explanation = false positive. No usable finding (device gone, wiped, unreachable, or technician cannot determine) = unresolved.",
+      "options": [
+        {"label": "Malicious artifacts confirmed on host", "next": "contain-host", "note": "Escalate as infection."},
+        {"label": "Benign explanation confirmed", "next": "close-fp", "note": "False positive; tune."},
+        {"label": "No usable finding / device unreachable", "next": "unresolved-host", "note": "Rely on network action + monitoring."}
+      ]
+    },
+
+    "unresolved-host": {
+      "type": "step",
+      "title": "Unresolved host — network protection and coverage note",
+      "instructions": "The specific host could not be identified or confirmed. Do not simply close — the alert may reflect a real infection you cannot yet see.\n\n- Ensure the malicious destination is blocked/denied on the Meraki appliance so any affected host is denied C2 while attribution continues.\n- Document everything known about the source (internal IP, MAC/OUI if any, switchport/SSID/VLAN, tenant, time window) and the reason attribution failed (NAT/DHCP churn, guest/transient device, no client record, no endpoint sensor coverage).\n- File the gap as a coverage-improvement item (logging, sensor deployment, network segmentation/visibility).\n- Decide whether the malicious-destination evidence is strong enough to escalate for broader hunting, or can be monitored with defined re-open triggers (repeat signature hits, new hosts hitting the same destination).",
+      "evidence": [
+        {"id": "network-block", "label": "Destination blocked on appliance (confirm)", "type": "text"},
+        {"id": "known", "label": "What is known about the source & why attribution failed", "type": "textarea"},
+        {"id": "gap", "label": "Coverage-improvement item & re-open triggers", "type": "textarea"}
+      ],
+      "next": "unresolved-verdict?"
+    },
+
+    "unresolved-verdict?": {
+      "type": "decision",
+      "title": "Is the destination evidence strong enough to escalate?",
+      "instructions": "Credible contact with known-bad C2/malware infrastructure may justify escalation for broader hunting even without a confirmed host; weak or ambiguous evidence can be blocked, monitored, and closed with a coverage note.",
+      "options": [
+        {"label": "Strong — credible C2/malware infrastructure contacted", "next": "escalate", "note": "Escalate for hunting despite no host."},
+        {"label": "Weak / ambiguous — block, monitor, close", "next": "close-unresolved", "note": "Network action + coverage note; close."}
+      ]
+    },
+
+    "contain-host": {
+      "type": "step",
+      "title": "Contain the host and infrastructure",
+      "instructions": "Confirmed malicious C2/infection. Contain before scoping and handoff.\n\n- Isolate the affected host: network-contain it in the endpoint platform if managed, or use network-level isolation on the appliance/switch (block, quarantine VLAN, disable port) if it is not.\n- Block/sinkhole the malicious destination(s) across the environment and set the signature to PREVENT if it was DETECT-only.\n- On a managed host, block the payload by hash, kill the offending process, and remove persistence.\n- Record every containment action with timestamps.",
+      "evidence": [
+        {"id": "isolation", "label": "Host isolation (EDR or network-level) & time", "type": "textarea"},
+        {"id": "dest-block", "label": "Destination block/sinkhole; signature set to PREVENT", "type": "textarea"},
+        {"id": "host-actions", "label": "Hash block / process kill / persistence removal (if managed)", "type": "textarea"}
+      ],
+      "next": "scope",
+      "playbook": "CONTAINMENT"
+    },
+
+    "scope": {
+      "type": "step",
+      "title": "Scope across the environment",
+      "instructions": "Determine how far the threat reached before handoff.\n\n- Query the Meraki flow/IDS data across networks for any OTHER internal hosts contacting the same destination or tripping the same signature.\n- On the endpoint platform, hunt the payload hash and related indicators across all managed hosts.\n- Build a timeline from first contact to latest activity and identify lateral movement or additional affected hosts/accounts (review identity logs for suspicious auth tied to affected users).\n- Assess what data/systems the affected host(s) could reach and whether exfiltration occurred.",
+      "evidence": [
+        {"id": "other-hosts", "label": "Other hosts hitting same dest/signature (Meraki)", "type": "textarea"},
+        {"id": "hunt", "label": "Fleet-wide hash/indicator hunt (EDR)", "type": "textarea"},
+        {"id": "timeline", "label": "Timeline; lateral movement; affected accounts", "type": "textarea"}
+      ],
+      "next": "escalate",
+      "playbook": "SCOPING"
+    },
+
+    "escalate": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "Confirmed (or strongly suspected) malicious egress activity with initial containment and scope established. Hand off with a complete package.\n\n- Ensure signature/flow details, destination enrichment, host identification, process/payload findings (or technician report), timeline, affected hosts/accounts, and containment actions are all recorded above.\n- Assign incident severity per your matrix and notify the on-call IR owner.\n- Confirm volatile evidence was preserved and Meraki/EDR/identity logs retained before their retention windows expire.\n- If the appliance was DETECT-only and the connection completed, or if endpoint prevention missed the payload, note the gap for post-incident review.\n- Transfer ownership; eradication and recovery proceed under the IR playbook.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Snort egress signature confirmed as malicious C2/infection; host contained (or network-isolated), scoped via Meraki + EDR, and escalated to IR."
+    },
+
+    "close-fp": {
+      "type": "terminal",
+      "title": "Close — false positive",
+      "instructions": "The signature fired on legitimate traffic: a benign process reaching a clean or miscategorized destination, or a broad heuristic misfiring on a legitimate service.\n\n- Document the benign explanation and the confirming evidence (legitimate process, clean destination enrichment, user confirmation, or technician finding).\n- Propose scoped tuning: refine or suppress the specific signature for the confirmed-benign destination without weakening genuine egress-threat coverage.\n- Note any signature that is systematically over-firing for detection engineering.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Snort egress signature determined a false positive (legitimate traffic / miscategorized destination); scoped tuning proposed."
+    },
+
+    "close-unresolved": {
+      "type": "terminal",
+      "title": "Close — unattributed, network protection in place",
+      "instructions": "The host could not be identified or confirmed, and the destination evidence did not warrant full escalation, but protective steps are in place.\n\n- Confirm the malicious/suspect destination is blocked on the appliance and the signature is at PREVENT.\n- Record the attribution failure and the coverage-improvement item (visibility, sensor coverage, logging, segmentation).\n- Define explicit re-open triggers: repeat signature hits, the same destination reappearing, or new hosts contacting it.",
+      "disposition": "other",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Snort egress alert could not be attributed to a confirmed host; destination blocked at the appliance and a visibility-gap coverage item filed. Closed with monitoring and re-open triggers."
+    }
+  }
+}
