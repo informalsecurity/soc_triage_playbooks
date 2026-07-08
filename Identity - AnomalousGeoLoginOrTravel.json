@@ -1,0 +1,171 @@
+{
+  "id": "proc-impossible-travel-geo-login",
+  "title": "Anomalous Geographic Login (Impossible Travel)",
+  "version": "1.0",
+  "detectionType": "Identity / Impossible travel — anomalous geographic login",
+  "severityDefault": "medium",
+  "description": "Two (or more) authentications for one identity occurred from locations far enough apart that the implied travel between them, in the elapsed time, is physically impossible or highly improbable. The label is derived from IP geolocation, which is frequently an artifact rather than a real position: a corporate or commercial VPN, a proxy, mobile carrier-grade NAT, a cloud/mail-fetch service, or Tor can all place a legitimate user's session in a distant or foreign region. The single most important triage move is therefore to characterize BOTH IP endpoints thoroughly — establishing whether either is a VPN/proxy/hosting/mobile/anonymization artifact — and only then determine whether genuinely impossible travel remains, which would indicate account compromise.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture both legs of the travel",
+      "instructions": "Confirm this is a new alert (not a duplicate) and record BOTH authentications that make up the 'impossible' pair, because the anomaly is defined by their relationship.\n\n- Note the identity: user principal / account, role, home location/timezone, and normal working pattern.\n- For each leg: the source IP, its reported geolocation, the timestamp, the application/resource, and the authentication method (password, MFA, token, legacy protocol).\n- Compute the implied travel: distance between the two locations and the elapsed time, i.e. WHY the system flagged it as impossible.\n- Note the outcome of each leg (success/failure) and whether the two sessions overlap in time (concurrency is a stronger signal than sequential logins).\n- Record the reporting identity source and alert time.",
+      "evidence": [
+        {"id": "user", "label": "Identity (account / role / home location / normal pattern)", "type": "textarea"},
+        {"id": "leg-a", "label": "Leg A: IP / geo / time / app / auth method / outcome", "type": "textarea"},
+        {"id": "leg-b", "label": "Leg B: IP / geo / time / app / auth method / outcome", "type": "textarea"},
+        {"id": "implied", "label": "Implied travel (distance / elapsed time) & concurrency", "type": "textarea"}
+      ],
+      "next": "characterize-ips"
+    },
+
+    "characterize-ips": {
+      "type": "step",
+      "title": "Deeply characterize BOTH IP endpoints",
+      "instructions": "This is the decisive step. Geolocation lies constantly; determine what each IP actually IS before trusting where it claims to be. Do this for BOTH legs.\n\n- Classify each IP's type: residential ISP, mobile/cellular (carrier-grade NAT — often geolocates far from the real user), commercial VPN/proxy, corporate/sanctioned VPN egress, cloud/hosting/datacenter, or Tor exit.\n- Identify the ASN and owning organization for each IP: is it a consumer ISP, a known VPN/hosting provider, a cloud region, or your own corporate egress range?\n- Determine whether either IP belongs to a VPN or anonymization service — this is the most common cause of false 'impossible travel'. Check threat-intel/IP-reputation for anonymizer/proxy/hosting flags.\n- Assess geolocation confidence: mobile and VPN IPs frequently resolve to a provider's registration city, not the user's real position; note where confidence is low.\n- Check whether either IP/ASN is one your organization or this user legitimately uses (corporate VPN, sanctioned remote-access, known mobile carrier).",
+      "evidence": [
+        {"id": "type-a", "label": "Leg A IP type & ASN/org (VPN? mobile? hosting? corp?)", "type": "textarea"},
+        {"id": "type-b", "label": "Leg B IP type & ASN/org (VPN? mobile? hosting? corp?)", "type": "textarea"},
+        {"id": "anon-flags", "label": "Anonymizer/VPN/proxy reputation flags (either leg)", "type": "textarea"},
+        {"id": "geo-confidence", "label": "Geolocation confidence notes (low for mobile/VPN)", "type": "textarea"}
+      ],
+      "next": "still-impossible?"
+    },
+
+    "still-impossible?": {
+      "type": "decision",
+      "title": "After accounting for IP artifacts, is the travel still genuinely impossible?",
+      "instructions": "Re-evaluate the anomaly with the IP characterization in hand. If a VPN/proxy/mobile/cloud artifact explains one leg's location, the 'travel' may be a geolocation fiction, not real movement. If both IPs are genuine physical-access residential/mobile connections in truly incompatible places at incompatible times, the anomaly stands.",
+      "options": [
+        {"label": "Explained by IP artifact — a VPN/proxy/mobile/cloud location, not real travel", "next": "verify-benign", "note": "The 'impossibility' dissolves; verify legit user."},
+        {"label": "Still genuinely impossible after accounting for IPs", "next": "user-context", "note": "Real anomaly — investigate for takeover."},
+        {"label": "Unclear — cannot yet tell if an IP is a VPN/artifact", "next": "user-verify", "note": "Confirm with user out-of-band."}
+      ]
+    },
+
+    "verify-benign": {
+      "type": "step",
+      "title": "Confirm the benign explanation",
+      "instructions": "An IP artifact appears to explain the anomaly (e.g. the user is on a commercial/corporate VPN, mobile data, or a cloud/mail service fetched mail from a datacenter). Confirm before closing.\n\n- Confirm the specific artifact: which leg is the VPN/proxy/mobile/cloud endpoint and that it plausibly belongs to the user's normal tooling.\n- Verify device familiarity: are both sessions from known/managed devices previously seen for this user?\n- Confirm MFA was satisfied legitimately on the anomalous leg (a real factor, not fatigue/coercion).\n- Where feasible, confirm the user was in fact using that VPN/connection at that time (self-service check or brief user confirmation).\n- Rule out that the 'VPN' IP is actually attacker anonymization infrastructure rather than a sanctioned/known service.",
+      "evidence": [
+        {"id": "artifact", "label": "Which leg is the artifact & does it fit user's tooling", "type": "textarea"},
+        {"id": "device", "label": "Device familiarity (both legs known/managed?)", "type": "textarea"},
+        {"id": "mfa", "label": "MFA satisfied legitimately on anomalous leg", "type": "text"},
+        {"id": "confirm", "label": "User/self-service confirmation of VPN/connection use", "type": "textarea"}
+      ],
+      "next": "benign-verdict?"
+    },
+
+    "benign-verdict?": {
+      "type": "decision",
+      "title": "Is the benign explanation confirmed?",
+      "instructions": "If the artifact, device, MFA, and (where available) user confirmation all support legitimate use, close as false positive. If confirmation raises doubt — the 'VPN' is unknown anonymization infrastructure, the device is unfamiliar, or MFA looks coerced — escalate to the takeover investigation.",
+      "options": [
+        {"label": "Confirmed benign — legitimate user via VPN/mobile/cloud", "next": "close-fp", "note": "False positive; document and tune."},
+        {"label": "Doubt remains — unknown anonymizer / unfamiliar device", "next": "user-context", "note": "Investigate as possible takeover."}
+      ]
+    },
+
+    "user-context": {
+      "type": "step",
+      "title": "Establish user baseline and session context",
+      "instructions": "The travel appears genuinely anomalous, or benign confirmation failed. Determine whether the legitimate user could still be behind both legs before assuming compromise.\n\n- Travel plausibility: is the user known to be traveling? Even if flagged, some 'impossible' pairs are explained by an in-flight connection change or a forgotten VPN toggle.\n- Concurrency: are the two sessions simultaneously active from incompatible locations? Overlapping active sessions are a strong takeover signal.\n- Device & method: is the anomalous leg from a known/managed device? Was MFA satisfied, and was there MFA fatigue (repeated prompts before approval) or an unusual factor/location?\n- Historical pattern: has this user legitimately authenticated from this region/ASN before, or is it entirely new?",
+      "evidence": [
+        {"id": "travel", "label": "Travel plausibility / known trip", "type": "textarea"},
+        {"id": "concurrency", "label": "Concurrent active sessions from both locations?", "type": "text"},
+        {"id": "device-mfa", "label": "Device familiarity & MFA (fatigue? unusual factor?)", "type": "textarea"},
+        {"id": "history", "label": "Prior logins from this region/ASN?", "type": "text"}
+      ],
+      "next": "post-login"
+    },
+
+    "post-login": {
+      "type": "step",
+      "title": "Review post-authentication behavior on the anomalous session",
+      "instructions": "Behavior after login separates a benign-but-unusual location from an active takeover.\n\n- Review actions in the anomalous session: mailbox rule creation/forwarding, mass file access/download, permission or MFA-method changes, OAuth app consent grants, atypical application access.\n- Check for identity-persistence moves: new MFA device registered, password change, recovery info altered.\n- Assess whether the activity matches the user's role and normal behavior, or is anomalous in type, volume, or timing.\n- Correlate: are other accounts showing similar impossible-travel or anomalous logins from the same ASN/region (campaign indicator)?",
+      "evidence": [
+        {"id": "actions", "label": "Session actions (rules / downloads / consents / access)", "type": "textarea"},
+        {"id": "persistence", "label": "Identity-persistence changes (MFA / pw / recovery)", "type": "textarea"},
+        {"id": "campaign", "label": "Similar anomalies on other accounts (same ASN/region)?", "type": "text"}
+      ],
+      "next": "verdict?"
+    },
+
+    "verdict?": {
+      "type": "decision",
+      "title": "What is the verdict on the anomalous login?",
+      "instructions": "Weigh IP characterization, baseline, and behavior together. Concurrent sessions, unfamiliar device, MFA fatigue/anomalous factor, malicious post-login actions, or a matching multi-account campaign = account takeover. A confirmed benign explanation with normal behavior = false positive. If unresolved, verify with the user out-of-band before deciding.",
+      "options": [
+        {"label": "Account takeover / unauthorized access confirmed", "next": "contain-identity", "note": "Malicious indicators present."},
+        {"label": "Legitimate user, benign explanation confirmed", "next": "close-fp", "note": "False positive."},
+        {"label": "Unresolved — verify with user out-of-band", "next": "user-verify", "note": "Confirm directly before deciding."}
+      ]
+    },
+
+    "user-verify": {
+      "type": "step",
+      "title": "Verify directly with the user (out-of-band)",
+      "instructions": "Ambiguous case. Reach the user through a trusted channel — not the possibly-compromised account or session — to confirm the activity.\n\n- Use a known phone/secondary channel; do not rely on the account under investigation.\n- Ask whether they logged in at those times from those locations, and whether they use any VPN, mobile hotspot, or remote-access tool that could explain the geography.\n- Ask whether they approved any MFA prompts they did not initiate.\n- If you cannot reach them promptly and any takeover indicator exists, treat as compromise and contain.",
+      "evidence": [
+        {"id": "channel", "label": "Channel used & who was contacted", "type": "text"},
+        {"id": "result", "label": "User's confirmation / denial & VPN usage", "type": "textarea"}
+      ],
+      "next": "verify-result?"
+    },
+
+    "verify-result?": {
+      "type": "decision",
+      "title": "Did the user confirm the activity as their own?",
+      "instructions": "Route on the user's confirmation. A confirmed VPN/mobile explanation closes it; denial or unreachable-with-indicators means containment.",
+      "options": [
+        {"label": "User confirms — it was them (incl. VPN/mobile use)", "next": "close-fp", "note": "Benign; close as false positive."},
+        {"label": "User denies, or unreachable with indicators", "next": "contain-identity", "note": "Treat as compromise."}
+      ]
+    },
+
+    "contain-identity": {
+      "type": "step",
+      "title": "Contain the identity",
+      "instructions": "Credible account takeover. Contain the identity before scoping and handoff.\n\n- Revoke active sessions/tokens for the account and force re-authentication.\n- Reset the password and require trusted MFA re-enrollment; remove any attacker-registered MFA factors.\n- Reverse persistence: delete malicious mailbox rules/forwarding, revoke illicit OAuth grants, restore recovery settings.\n- Block or restrict the malicious source IP/ASN where appropriate and record every action with timestamps.",
+      "evidence": [
+        {"id": "session-revoke", "label": "Session/token revocation & password reset (time)", "type": "textarea"},
+        {"id": "mfa-fix", "label": "MFA factors removed / re-enrolled", "type": "textarea"},
+        {"id": "persist-removed", "label": "Rules / OAuth grants / recovery reversed", "type": "textarea"}
+      ],
+      "next": "scope-identity",
+      "playbook": "CONTAINMENT"
+    },
+
+    "scope-identity": {
+      "type": "step",
+      "title": "Scope the compromise",
+      "instructions": "Determine what the attacker reached before handoff.\n\n- Build a timeline of the attacker's session(s): first access to latest activity, and everything done in between.\n- Enumerate data accessed, exported, or shared, and any messages sent from the account.\n- Check for lateral movement: other accounts contacted, internal phishing, shared resources touched.\n- Identify other accounts showing the same anomalous-login pattern from the same infrastructure (campaign scope) and whether any secrets/credentials were exposed.",
+      "evidence": [
+        {"id": "timeline", "label": "Attacker session timeline", "type": "textarea"},
+        {"id": "data", "label": "Data accessed / exported / sent", "type": "textarea"},
+        {"id": "lateral", "label": "Lateral movement & other affected accounts", "type": "textarea"}
+      ],
+      "next": "escalate-identity",
+      "playbook": "SCOPING"
+    },
+
+    "escalate-identity": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "Confirmed identity compromise with containment and scope established. Hand off with a complete package.\n\n- Ensure identity, both-leg IP characterization, session timeline, data exposure, and containment actions are all recorded above.\n- Assign incident severity per your matrix and notify the on-call IR owner.\n- Preserve identity/audit logs before retention windows expire.\n- If multiple accounts show the same pattern, flag it as a possible campaign for broader response.\n- Transfer ownership; eradication, notifications, and recovery proceed under the IR playbook.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Confirmed account takeover behind an impossible-travel anomaly; identity contained, scoped, and escalated to IR."
+    },
+
+    "close-fp": {
+      "type": "terminal",
+      "title": "Close — false positive (IP artifact / legitimate travel)",
+      "instructions": "The anomaly is explained by an IP-geolocation artifact (corporate or commercial VPN, mobile carrier-grade NAT, cloud/mail-fetch service, or Tor by a privacy-conscious user) or by confirmed legitimate travel, with familiar devices, legitimate MFA, and normal behavior — confirmed with the user where applicable.\n\n- Document the specific explanation and the confirming evidence (which leg was the artifact, device familiarity, user confirmation).\n- If this pattern will recur for this user or IP/ASN (a sanctioned VPN egress, the user's regular mobile carrier, a habitual travel corridor), propose scoped tuning/allow-listing so it does not re-alert without cause.\n- Note any systemic geolocation issue (e.g. a mail service region, a corporate VPN egress abroad) for detection engineering.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Impossible-travel anomaly explained by an IP artifact (VPN/mobile/cloud) or legitimate travel; behavior normal. Closed as false positive with tuning proposed."
+    }
+  }
+}
