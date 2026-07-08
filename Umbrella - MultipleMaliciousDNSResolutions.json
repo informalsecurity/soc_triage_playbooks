@@ -1,0 +1,312 @@
+{
+  "id": "proc-umbrella-multiple-malicious-dns",
+  "title": "Multiple Malicious DNS Resolutions",
+  "version": "1.0",
+  "detectionType": "DNS / Umbrella — bulk resolutions in risky categories",
+  "severityDefault": "medium",
+  "description": "A host or user generated a high volume (e.g. 25+ within one hour) of DNS resolutions falling into risky categories — Malware, Command-and-Control, Botnet, Newly Seen Domains, or Phishing. The intent is to catch threats that endpoint detection may have missed (a payload that evaded CrowdStrike but still reaches out to threat-intel-known or newly-seen infrastructure), while acknowledging that bulk risky resolutions are frequently benign (ad/analytics/CDN sprawl, a single page loading many trackers, newly-registered legitimate domains). The core of triage is attributing the resolutions to an originating process, which requires cross-referencing Umbrella (what was resolved) with the endpoint detection platform (what process resolved it) and identity logs where a user/egress IP is involved. A fallback path handles cases where the originating system is not managed by the endpoint platform.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture the resolution set",
+      "instructions": "Confirm this is a new alert (not a duplicate) and capture what the DNS layer actually saw.\n\n- Record the identifier Umbrella attributes the activity to: internal host, roaming client, network/egress public IP, or a username if tied to a directory.\n- Export the list of flagged resolutions with their categories, timestamps, and counts per category.\n- Note the category mix: is it dominated by Newly Seen Domains, by Malware/C2/Botnet, by Phishing, or a blend.\n- Note the time window and whether the resolutions are clustered (a burst) or spread evenly (possible beaconing).\n- Record the reporting source and alert time.",
+      "evidence": [
+        {"id": "attribution", "label": "Umbrella attribution (host / roaming client / egress IP / user)", "type": "textarea"},
+        {"id": "resolutions", "label": "Flagged domains, categories, counts", "type": "textarea"},
+        {"id": "mix", "label": "Category mix (NSD-heavy / malware-C2 / phishing / blend)", "type": "text"},
+        {"id": "pattern", "label": "Timing: burst vs. even/periodic", "type": "text"}
+      ],
+      "next": "triage-domains"
+    },
+
+    "triage-domains": {
+      "type": "step",
+      "title": "Enrich and separate the domains",
+      "instructions": "Not all flagged domains carry equal weight. Enrich them before touching the host.\n\n- For each distinctive domain, gather reputation and any known campaign/malware/phishing affiliation from a threat-intel capability.\n- Separate the set into buckets: (a) credible malicious infrastructure (known C2/malware/botnet or convincing phishing), (b) newly-seen/low-info domains with no clear verdict, and (c) obvious ad/analytics/tracker/CDN or otherwise benign-but-noisy domains.\n- For Newly Seen Domains, check registration age and whether they resemble legitimate new services vs. algorithmically-generated names (DGA-like).\n- Note whether any domain is a lookalike/typosquat of a brand your users would trust (phishing signal).",
+      "evidence": [
+        {"id": "malicious-bucket", "label": "Credible malicious domains (intel-backed)", "type": "textarea"},
+        {"id": "unknown-bucket", "label": "Newly-seen / unresolved domains (age, DGA-like?)", "type": "textarea"},
+        {"id": "benign-bucket", "label": "Ad / analytics / CDN / benign-noisy domains", "type": "textarea"}
+      ],
+      "next": "host-identified?"
+    },
+
+    "host-identified?": {
+      "type": "decision",
+      "title": "Can you identify the specific originating host/endpoint?",
+      "instructions": "Umbrella may attribute activity to a specific internal host, or only to a network egress/public IP (many hosts behind NAT) or an off-network roaming identifier. You must know the endpoint before you can attribute a process.",
+      "options": [
+        {"label": "Yes — specific host/endpoint identified", "next": "in-edr?", "note": "Proceed to process attribution."},
+        {"label": "No — only an egress IP or ambiguous attribution", "next": "identify-host", "note": "Resolve the host first."}
+      ]
+    },
+
+    "identify-host": {
+      "type": "step",
+      "title": "Resolve the originating host behind the egress",
+      "instructions": "Attribution is only to a public/egress IP or a roaming client. Narrow it to a specific system and, where relevant, a user.\n\n- Correlate the Umbrella timestamps against internal DHCP/DNS/NAT/proxy logs to map the egress IP to an internal host at that moment.\n- If the resolutions are tied to a user, review identity logs (Okta) for sessions active from that egress IP in the window, to associate a person and their device.\n- Consider roaming/off-network clients: an Umbrella roaming client ID or device posture record may name the endpoint directly.\n- If multiple hosts sit behind the egress IP, use the resolved-domain timing to narrow which host(s) generated the flagged lookups.",
+      "evidence": [
+        {"id": "host-mapping", "label": "Egress IP → internal host mapping (source & time)", "type": "textarea"},
+        {"id": "okta-session", "label": "Okta sessions from egress IP in window (user/device)", "type": "textarea"},
+        {"id": "narrowed", "label": "Host(s) narrowed / still ambiguous", "type": "text"}
+      ],
+      "next": "host-resolved?"
+    },
+
+    "host-resolved?": {
+      "type": "decision",
+      "title": "Was a specific host successfully identified?",
+      "instructions": "Decide whether correlation gave you an actual endpoint to investigate, or whether attribution remains to an IP only.",
+      "options": [
+        {"label": "Yes — host now identified", "next": "in-edr?", "note": "Continue to process attribution."},
+        {"label": "No — cannot resolve to a single host", "next": "no-host-branch", "note": "Investigate at network/identity level."}
+      ]
+    },
+
+    "in-edr?": {
+      "type": "decision",
+      "title": "Is the identified host managed by the endpoint detection platform (CrowdStrike)?",
+      "instructions": "This determines whether process-level attribution is even possible. Managed workstations/servers with the sensor allow you to tie a DNS resolution to a process. Unmanaged, BYOD, IoT/OT, printers, or guest devices do not.",
+      "options": [
+        {"label": "Yes — host has the sensor", "next": "edr-process", "note": "Pivot to the endpoint platform for process attribution."},
+        {"label": "No — unmanaged / BYOD / IoT / no sensor", "next": "no-edr-branch", "note": "No process attribution; use network + user evidence."}
+      ]
+    },
+
+    "edr-process": {
+      "type": "step",
+      "title": "Attribute the resolutions to a process in the endpoint platform",
+      "instructions": "Pivot from Umbrella (what was resolved) to the endpoint platform (what resolved it). This is the decisive step.\n\n- Search the host's endpoint telemetry around the Umbrella timestamps for DNS request / network events matching the flagged domains.\n- Identify the initiating process for the resolutions: a browser or Explorer/shell, a known application, or an unexpected binary (script host, LOLBin, unsigned/renamed executable, something in a user-writable/temp path).\n- For any suspicious process, capture its path, signature, parent process, and reputation, and note whether the endpoint platform itself raised any related (possibly lower-severity or suppressed) detections.\n- Determine whether the resolutions map to user-driven browsing (many domains loaded by one page) or to autonomous process activity (periodic callbacks independent of user action).",
+      "evidence": [
+        {"id": "process", "label": "Initiating process (path / signer / parent)", "type": "textarea"},
+        {"id": "process-class", "label": "Browser/shell vs. unexpected binary; reputation", "type": "textarea"},
+        {"id": "driver", "label": "User-driven browsing vs. autonomous callbacks", "type": "textarea"},
+        {"id": "edr-related", "label": "Related endpoint detections (even suppressed)?", "type": "text"}
+      ],
+      "next": "process-verdict?"
+    },
+
+    "process-verdict?": {
+      "type": "decision",
+      "title": "What does the initiating process indicate?",
+      "instructions": "Combine the process identity with the domain buckets. An unexpected/unsigned binary or autonomous callbacks to malicious infrastructure indicates a missed infection. A browser resolving the domains points to user activity — which is either a phishing click or benign browsing depending on the domains. If the process itself looks fine but resolved credible malicious domains, keep it as suspicious and investigate the malicious branch.",
+      "options": [
+        {"label": "Suspicious process / autonomous callbacks to bad infra", "next": "malware-confirm", "note": "Likely payload that evaded the endpoint platform."},
+        {"label": "Browser/user resolved credible PHISHING domains", "next": "phishing-branch", "note": "Possible phishing click; check email & credentials."},
+        {"label": "Browser/user resolved ad/CDN/newly-seen NOISE only", "next": "benign-browsing", "note": "Likely benign browsing / adtech sprawl."}
+      ]
+    },
+
+    "no-edr-branch": {
+      "type": "step",
+      "title": "Investigate without endpoint process attribution",
+      "instructions": "The host has no sensor, so you cannot see the initiating process. Build the case from network, DNS, and user evidence instead.\n\n- Characterize the device: what it is (BYOD laptop, phone, IoT/OT, printer, server), who owns/uses it, and what it is normally expected to do on the network.\n- Analyze the DNS pattern itself: periodic/beaconing cadence and DGA-like names suggest automated malware; a burst of mixed ad/tracker domains suggests browsing.\n- Gather any available network evidence: firewall/proxy/NetFlow showing whether connections actually followed the resolutions, to which destinations, and data volume.\n- If a user is associated, review identity logs (Okta) for suspicious authentication around the window and interview the user about their activity.",
+      "evidence": [
+        {"id": "device-nature", "label": "Device type / owner / expected behavior", "type": "textarea"},
+        {"id": "dns-pattern", "label": "DNS pattern analysis (beaconing? DGA-like?)", "type": "textarea"},
+        {"id": "netflow", "label": "Firewall/proxy/NetFlow follow-through evidence", "type": "textarea"},
+        {"id": "user-evidence", "label": "Okta / user interview findings", "type": "textarea"}
+      ],
+      "next": "no-edr-verdict?"
+    },
+
+    "no-edr-verdict?": {
+      "type": "decision",
+      "title": "What does the network/DNS/user evidence indicate?",
+      "instructions": "Without process attribution, weigh the strongest available signals: pattern shape, follow-through connections, domain reputation, and user account. Err toward caution when malicious infrastructure was contacted and connections followed.",
+      "options": [
+        {"label": "Automated callbacks to malicious infra — likely infection", "next": "malware-confirm", "note": "Treat as compromised despite no sensor."},
+        {"label": "Phishing domains + user activity", "next": "phishing-branch", "note": "Investigate as phishing click."},
+        {"label": "Benign browsing / adtech / device noise", "next": "benign-browsing", "note": "No malicious follow-through."},
+        {"label": "Cannot determine — insufficient visibility", "next": "no-host-branch", "note": "Escalate for visibility / deeper collection."}
+      ]
+    },
+
+    "no-host-branch": {
+      "type": "step",
+      "title": "Handle unresolved attribution",
+      "instructions": "You cannot pin the activity to a specific host, or you lack the visibility to reach a verdict. Do not simply close — the alert may reflect a real infection you cannot yet see.\n\n- Document exactly what attribution you DO have (egress IP, network segment, time window, user candidates).\n- Take proportionate protective action: block/sinkhole the credible malicious domains at the DNS/network layer so any affected host is denied resolution while you investigate.\n- Note what visibility gap prevented attribution (unmanaged segment, NAT with insufficient logging, missing sensor coverage) as a coverage improvement item.\n- Decide whether the malicious-domain evidence is strong enough to escalate for broader hunting, or whether it can be monitored.",
+      "evidence": [
+        {"id": "known-attribution", "label": "Attribution available (IP / segment / candidates)", "type": "textarea"},
+        {"id": "protective", "label": "Protective action taken (domain block/sinkhole)", "type": "textarea"},
+        {"id": "gap", "label": "Visibility gap / coverage improvement item", "type": "textarea"}
+      ],
+      "next": "no-host-verdict?"
+    },
+
+    "no-host-verdict?": {
+      "type": "decision",
+      "title": "Is the malicious-domain evidence strong enough to escalate?",
+      "instructions": "Even without a host, credible contact with known-bad infrastructure may justify escalation for broader hunting; weak/benign evidence can be monitored and closed with a coverage note.",
+      "options": [
+        {"label": "Strong — credible malicious infra contacted", "next": "escalate-threat", "note": "Escalate for hunting despite no host."},
+        {"label": "Weak / benign — monitor and close", "next": "close-unresolved", "note": "Protective block + coverage note; close."}
+      ]
+    },
+
+    "malware-confirm": {
+      "type": "step",
+      "title": "Confirm and characterize the suspected infection",
+      "instructions": "Evidence points to malware that endpoint detection missed or that is running on an unmonitored host. Pin down what you are dealing with before containment.\n\n- Confirm the malicious nature: match the process/domains to a known family or campaign where possible, and confirm connections followed the resolutions (actual C2/beaconing, not just lookups).\n- On a managed host, collect the payload details: file path(s), hash(es), persistence mechanism, and how it likely arrived (email, download, removable media, lateral).\n- Establish the beaconing timeline: first callback to latest, and cadence.\n- Preserve volatile evidence (running processes, network connections, memory artifacts) before remediation.",
+      "evidence": [
+        {"id": "family", "label": "Family/campaign match & C2 follow-through", "type": "textarea"},
+        {"id": "payload", "label": "Payload path/hash/persistence/arrival vector", "type": "textarea"},
+        {"id": "beacon-timeline", "label": "Beaconing timeline & cadence", "type": "textarea"}
+      ],
+      "next": "contain-host"
+    },
+
+    "contain-host": {
+      "type": "step",
+      "title": "Contain the host and infrastructure",
+      "instructions": "Credible infection. Contain before scoping and handoff.\n\n- Isolate the affected host from the network per policy while preserving investigative access; for an unmanaged host, use network-level isolation (switchport/NAC/segment block).\n- Sinkhole or block the malicious domains and known C2 IPs at the DNS and network layers across the environment.\n- Block the payload by hash on the endpoint platform where the host is managed.\n- Record every containment action with timestamps.",
+      "evidence": [
+        {"id": "isolation", "label": "Host isolation (managed or network-level) & time", "type": "textarea"},
+        {"id": "domain-block", "label": "Domain/C2 sinkhole & block actions", "type": "textarea"},
+        {"id": "hash-block", "label": "Payload hash block (if managed)", "type": "text"}
+      ],
+      "next": "scope-threat",
+      "playbook": "CONTAINMENT"
+    },
+
+    "scope-threat": {
+      "type": "step",
+      "title": "Scope across the environment",
+      "instructions": "Determine how far the threat reached before handoff.\n\n- Query the DNS layer (Umbrella) for any OTHER hosts resolving the same malicious domains — this is often the fastest fleet-wide scoping signal.\n- On the endpoint platform, hunt the payload hash and related indicators across all managed hosts.\n- Build a cross-host timeline and identify any lateral movement or additional affected users/accounts (review Okta for suspicious auth tied to affected users).\n- Assess what data/systems the affected host(s) and account(s) could reach.",
+      "evidence": [
+        {"id": "other-hosts", "label": "Other hosts resolving same domains (Umbrella)", "type": "textarea"},
+        {"id": "hash-hunt", "label": "Payload/indicator hunt across fleet (EDR)", "type": "textarea"},
+        {"id": "lateral", "label": "Lateral movement / affected accounts (Okta)", "type": "textarea"}
+      ],
+      "next": "escalate-threat",
+      "playbook": "SCOPING"
+    },
+
+    "escalate-threat": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "Confirmed (or strongly suspected) malicious activity that endpoint detection did not stop, with initial containment and scope established. Hand off with a complete package.\n\n- Ensure attribution, domain enrichment, process/payload details, beaconing timeline, affected hosts/accounts, and containment actions are all recorded above.\n- Assign incident severity per your matrix and notify the on-call IR owner.\n- Confirm volatile evidence was preserved and DNS/identity logs retained before their retention windows expire.\n- Note this as a potential endpoint-detection gap for post-incident review.\n- Transfer ownership; eradication and recovery proceed under the IR playbook.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Bulk malicious DNS resolutions attributed to malware/C2 that endpoint detection missed; contained, scoped, and escalated to IR."
+    },
+
+    "phishing-branch": {
+      "type": "step",
+      "title": "Investigate the suspected phishing click",
+      "instructions": "The resolutions include credible phishing domains reached via user/browser activity. Determine whether credentials were exposed.\n\n- Correlate with email security: find the message(s) delivering the phishing link, who received them, and who clicked (delivery/click telemetry).\n- Determine whether the user reached a credential-harvesting page and whether credentials were plausibly entered.\n- Review identity logs (Okta) for the affected user around and after the click: successful logins from unusual IPs, new MFA enrollment, MFA fatigue, or session anomalies indicating the harvested credentials were used.\n- Interview the user where feasible: did they enter credentials, approve an MFA prompt, or download anything.",
+      "evidence": [
+        {"id": "email", "label": "Delivering email(s), recipients, who clicked", "type": "textarea"},
+        {"id": "harvest", "label": "Credential-harvest page reached / creds entered?", "type": "textarea"},
+        {"id": "okta-post", "label": "Okta post-click anomalies (logins/MFA/session)", "type": "textarea"},
+        {"id": "user-account", "label": "User interview findings", "type": "textarea"}
+      ],
+      "next": "phishing-verdict?"
+    },
+
+    "phishing-verdict?": {
+      "type": "decision",
+      "title": "Were credentials exposed or the account compromised?",
+      "instructions": "If credentials were entered or Okta shows post-click account misuse, treat as an identity compromise. If the user clicked but did not submit credentials and there is no account misuse, it is a contained phishing exposure. If it was blocked or never engaged, it trends toward false positive / benign.",
+      "options": [
+        {"label": "Credentials exposed / account misused", "next": "contain-identity", "note": "Identity compromise — contain the account."},
+        {"label": "Clicked only, no credentials entered, no misuse", "next": "phishing-exposure-close", "note": "Contained exposure; harden and educate."},
+        {"label": "Blocked / not engaged — benign", "next": "close-fp", "note": "No exposure; close as false positive."}
+      ]
+    },
+
+    "contain-identity": {
+      "type": "step",
+      "title": "Contain the compromised identity",
+      "instructions": "Phishing led to credential exposure or account misuse. Contain the identity before scoping and handoff.\n\n- Revoke active sessions/tokens in the identity provider (Okta) and force re-authentication.\n- Reset the password and require trusted MFA re-enrollment; remove any attacker-registered MFA factors.\n- Reverse persistence on associated accounts: mailbox rules/forwarding, illicit OAuth grants, recovery-info changes.\n- Block the phishing domains at the DNS/network layer and record every action with timestamps.",
+      "evidence": [
+        {"id": "session-revoke", "label": "Session/token revocation & password reset (time)", "type": "textarea"},
+        {"id": "mfa-fix", "label": "MFA factors removed / re-enrolled", "type": "textarea"},
+        {"id": "persist-removed", "label": "Rules / OAuth / recovery reversed; domains blocked", "type": "textarea"}
+      ],
+      "next": "scope-identity",
+      "playbook": "CONTAINMENT"
+    },
+
+    "scope-identity": {
+      "type": "step",
+      "title": "Scope the identity compromise",
+      "instructions": "Determine what the attacker reached with the credentials before handoff.\n\n- Build a timeline of attacker authentication and activity from the identity logs (Okta) and downstream applications.\n- Enumerate data accessed/exported and messages sent from the account.\n- Check whether the same phishing campaign hit other users (email correlation) and whether other credentials were exposed.\n- Identify any lateral access to other systems the account could reach.",
+      "evidence": [
+        {"id": "attacker-timeline", "label": "Attacker auth/activity timeline (Okta + apps)", "type": "textarea"},
+        {"id": "data", "label": "Data accessed / exported / sent", "type": "textarea"},
+        {"id": "campaign", "label": "Other recipients/victims of the campaign", "type": "textarea"}
+      ],
+      "next": "escalate-identity",
+      "playbook": "SCOPING"
+    },
+
+    "escalate-identity": {
+      "type": "terminal",
+      "title": "Escalate identity compromise to incident response",
+      "instructions": "Confirmed credential/account compromise via phishing, with containment and scope established. Hand off with a complete package.\n\n- Ensure user, phishing domains/email, credential-exposure evidence, attacker timeline, data exposure, and containment actions are all recorded above.\n- Assign incident severity per your matrix and notify the on-call IR owner.\n- Preserve identity and email logs before retention windows expire.\n- Transfer ownership; eradication, notifications, and recovery proceed under the IR playbook.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Phishing click via flagged DNS resolutions led to identity compromise; account contained, scoped, and escalated to IR."
+    },
+
+    "benign-browsing": {
+      "type": "step",
+      "title": "Confirm benign browsing / adtech before closing",
+      "instructions": "The resolutions look like ordinary browsing noise — many ad/analytics/tracker/CDN domains and newly-registered-but-legitimate services loaded by normal web activity. Confirm before closing.\n\n- Verify the initiating process (where available) is a legitimate browser and that the resolutions coincide with genuine user browsing.\n- Confirm none of the flagged domains carry credible malicious intel once enriched (newly-seen ≠ malicious).\n- Confirm there is no beaconing cadence and no autonomous non-browser process involved.\n- Note whether the volume is explained by a single content-heavy site or normal daily browsing.",
+      "evidence": [
+        {"id": "browser-confirm", "label": "Legitimate browser + genuine browsing confirmed", "type": "textarea"},
+        {"id": "no-intel", "label": "No credible malicious intel on domains", "type": "text"},
+        {"id": "policy", "label": "Any acceptable-use/policy concern (non-malicious)?", "type": "text"}
+      ],
+      "next": "benign-verdict?"
+    },
+
+    "benign-verdict?": {
+      "type": "decision",
+      "title": "Is this cleanly benign, or benign-but-policy-relevant?",
+      "instructions": "Distinguish pure false positive from activity that is not malicious but violates acceptable-use (e.g. the user visited disreputable sites, used prohibited services) and may warrant a note to management/HR without being a security incident.",
+      "options": [
+        {"label": "Cleanly benign — normal browsing/adtech", "next": "close-fp", "note": "False positive; tune the noisy categories/domains."},
+        {"label": "Benign but policy-relevant activity", "next": "close-policy", "note": "Not malicious; refer per acceptable-use policy."}
+      ]
+    },
+
+    "close-fp": {
+      "type": "terminal",
+      "title": "Close — false positive (benign resolutions)",
+      "instructions": "The bulk resolutions are explained by benign activity (ordinary browsing, adtech/CDN sprawl, or newly-registered legitimate domains) with no malicious follow-through and no credential exposure.\n\n- Document the benign explanation and the attributing evidence (process/browser, clean enrichment, no beaconing).\n- Propose scoped tuning: raise thresholds or allow-list chronically noisy legitimate domains/categories so routine browsing does not re-alert.\n- Note any category that is systematically over-firing (e.g. Newly Seen Domains) for detection engineering.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Bulk risky-category DNS resolutions explained by benign browsing/adtech/newly-registered domains; no malicious follow-through. Closed as false positive with tuning proposed."
+    },
+
+    "close-policy": {
+      "type": "terminal",
+      "title": "Close — benign but policy-relevant",
+      "instructions": "Activity is not a security threat but violates acceptable-use (e.g. prohibited categories/services). No malware, C2, or credential exposure.\n\n- Document the non-malicious nature and the specific policy concern.\n- Refer to the appropriate owner (management/HR) per acceptable-use policy rather than treating as a security incident.\n- Propose tuning so genuinely benign traffic of this shape does not generate security alerts.",
+      "disposition": "other",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Resolutions non-malicious but policy-relevant; referred per acceptable-use policy and tuning proposed."
+    },
+
+    "phishing-exposure-close": {
+      "type": "terminal",
+      "title": "Close — phishing exposure, no compromise",
+      "instructions": "The user reached a phishing domain but did not submit credentials and no account misuse is evident.\n\n- Document that the link was clicked but no credentials were entered and identity logs show no misuse.\n- Block the phishing domains at the DNS/network layer and confirm the delivering email is remediated for all recipients.\n- Provide user awareness follow-up and confirm no other recipients engaged.\n- Propose blocking/tuning so the campaign's infrastructure is denied going forward.",
+      "disposition": "other",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Phishing link clicked but no credentials exposed and no account misuse; domains blocked, email remediated, user educated."
+    },
+
+    "close-unresolved": {
+      "type": "terminal",
+      "title": "Close — unattributed, protective action taken",
+      "instructions": "Attribution to a specific host was not possible and the malicious-domain evidence was insufficient to sustain a full investigation, but protective steps were taken.\n\n- Document the attribution available and the protective block/sinkhole applied to any credible malicious domains.\n- Record the visibility gap (unmanaged segment, insufficient NAT/DHCP logging, missing sensor coverage) as a coverage-improvement item for follow-up.\n- Note conditions that should trigger re-opening (repeat resolutions, new hosts hitting the same domains).",
+      "disposition": "other",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Bulk resolutions could not be attributed to a host; credible malicious domains blocked and a visibility-gap coverage item filed. Closed with monitoring."
+    }
+  }
+}
