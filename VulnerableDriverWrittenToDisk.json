@@ -1,0 +1,166 @@
+{
+  "id": "proc-vulnerable-driver-written-to-disk",
+  "title": "Vulnerable Driver Written to Disk",
+  "version": "1.0",
+  "detectionType": "Endpoint / Vulnerable driver (BYOVD precursor)",
+  "severityDefault": "medium",
+  "description": "A process wrote a kernel driver to disk that has been deemed vulnerable. Attackers abuse vulnerable drivers (Bring-Your-Own-Vulnerable-Driver) to gain privileged kernel access, disable security tooling, or escalate. The write itself is not proof of malice; this procedure separates malicious BYOVD from legitimate software that happens to ship a vulnerable driver.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "Confirm this is a new detection (not a duplicate of an open case) and record the identifiers you will reason about throughout.\n\n- Note the host: identifier, primary user/owner, and business role if known.\n- Note the driver file: filename, full path on disk, and file hash.\n- Note the writing process: the process that wrote the driver, its full path, and its parent process.\n- Record the detection timestamp and the reporting sensor/source.\n- Capture the account context the writing process ran under (user vs. SYSTEM/service).",
+      "evidence": [
+        {"id": "host", "label": "Host (ID / user / role)", "type": "text"},
+        {"id": "driver", "label": "Driver file (name / path / hash)", "type": "textarea"},
+        {"id": "writer", "label": "Writing process (path / parent / account)", "type": "textarea"},
+        {"id": "detected", "label": "Detection time & source sensor", "type": "text"}
+      ],
+      "next": "enrich-driver"
+    },
+
+    "enrich-driver": {
+      "type": "step",
+      "title": "Enrich the driver file",
+      "instructions": "Build a reputation and identity picture for the driver itself, independent of how it arrived.\n\n- Look up the driver hash in a threat-intel / reputation capability; note prevalence (common vs. rare in the wild) and any malware/campaign associations.\n- Determine the driver's identity: what product or vendor it legitimately belongs to, and which known vulnerability makes it flagged (the vulnerable driver, not necessarily malicious).\n- Check the digital signature: is it validly signed, by whom, and is the signing certificate revoked or expired.\n- Note whether this hash/driver appears on any known vulnerable-driver blocklist.",
+      "evidence": [
+        {"id": "rep", "label": "Hash reputation & prevalence", "type": "textarea"},
+        {"id": "identity", "label": "Legitimate product/vendor & known vuln", "type": "textarea"},
+        {"id": "sig", "label": "Signature status (signer / valid / revoked)", "type": "text"}
+      ],
+      "next": "enrich-writer"
+    },
+
+    "enrich-writer": {
+      "type": "step",
+      "title": "Analyze the writing process and its tree",
+      "instructions": "Understand what wrote the driver and whether that origin is legitimate.\n\n- Walk the full process tree: what launched the writing process, and what (if anything) it spawned afterward.\n- Classify the writer: known installer/updater, software-deployment/management agent, a user-launched application, a browser or archive tool (download origin), or an unknown/suspicious binary (script host, LOLBin, renamed, unusual path).\n- For the writing process binary, assess its own reputation and signature.\n- Establish provenance of the driver on disk: was it dropped by an installer, extracted from an archive, downloaded via browser, or written directly by the flagged process.",
+      "evidence": [
+        {"id": "tree", "label": "Process tree (parent → writer → children)", "type": "textarea"},
+        {"id": "writer-class", "label": "Writer classification & reputation", "type": "textarea"},
+        {"id": "provenance", "label": "How the driver reached disk (origin)", "type": "textarea"}
+      ],
+      "next": "writer-malicious?"
+    },
+
+    "writer-malicious?": {
+      "type": "decision",
+      "title": "Is the writing process itself clearly malicious or highly suspicious?",
+      "instructions": "Judge the writer independent of the driver. Treat as malicious/suspicious: unsigned or masqueraded binaries, execution from temp/user-writable/unusual paths, script hosts or LOLBins dropping a kernel driver, a tree rooted in phishing or exploited services, or writer hashes with known-bad reputation. Treat as not-obviously-malicious: recognized installers/updaters, deployment agents, and reputable signed applications.",
+      "options": [
+        {"label": "Yes — writer is malicious / highly suspicious", "next": "loaded-check-mal", "note": "Unsigned, masqueraded, LOLBin/script origin, or known-bad."},
+        {"label": "No / not obviously — writer looks like legitimate software", "next": "attribute-source", "note": "Installer, updater, deployment agent, or reputable app."}
+      ]
+    },
+
+    "attribute-source": {
+      "type": "step",
+      "title": "Attribute the legitimate source",
+      "instructions": "The writer looks legitimate; determine which benign scenario this is, because the disposition differs.\n\n- Correlate with change/deployment activity: does a software-deployment or patch system show a matching push to this host at this time (IT-sourced)?\n- Determine if the driver was bundled with legitimate software the user installed or that ships on the standard image (bundled-with-legit-software).\n- Determine if this is a user-initiated download/install of a real application that simply carries an old/vulnerable driver version (benign but outdated).\n- Confirm the user/owner's account of the activity where feasible, and whether the installing action was expected for that host's role.",
+      "evidence": [
+        {"id": "deploy-match", "label": "Matching IT deployment/change record?", "type": "textarea"},
+        {"id": "software", "label": "Parent software / bundle identified", "type": "textarea"},
+        {"id": "user-confirm", "label": "User/owner confirmation of activity", "type": "textarea"}
+      ],
+      "next": "loaded-check-benign"
+    },
+
+    "loaded-check-benign": {
+      "type": "step",
+      "title": "Check whether the driver was actually loaded",
+      "instructions": "Even for a legitimate source, a loaded vulnerable driver is a standing exposure. Establish load state before choosing a disposition.\n\n- Determine whether the driver was loaded into the kernel or only written to disk.\n- If loaded, note when, by what, and whether it remains loaded now.\n- Note whether the host's platform vulnerable-driver blocklist / protections are enabled (would the load even succeed).",
+      "evidence": [
+        {"id": "load-state", "label": "Loaded into kernel? (when / by what / still loaded)", "type": "textarea"},
+        {"id": "blocklist", "label": "Vulnerable-driver blocklist / protection state", "type": "text"}
+      ],
+      "next": "benign-branch?"
+    },
+
+    "benign-branch?": {
+      "type": "decision",
+      "title": "Which legitimate scenario applies?",
+      "instructions": "Select the attribution you established. This routes to the correct close-out, each with a different follow-up. If evidence does not actually support a benign scenario, go back and re-run the writer judgment.",
+      "options": [
+        {"label": "IT-pushed installer / sanctioned deployment", "next": "close-it-sourced", "note": "Matches a change/deployment record."},
+        {"label": "Bundled with legitimate software (expected)", "next": "close-bundled", "note": "Ships with sanctioned/known application."},
+        {"label": "Legit app, outdated/vulnerable driver version, no malicious intent", "next": "close-outdated", "note": "Real user install; just an old driver."},
+        {"label": "Doesn't fit — reconsider as suspicious", "next": "writer-malicious?", "note": "Return to the malice decision."}
+      ]
+    },
+
+    "close-it-sourced": {
+      "type": "terminal",
+      "title": "Close — sanctioned IT deployment",
+      "instructions": "Attributed to a sanctioned deployment. Close cleanly and drive down the standing exposure.\n\n- Document the matching deployment/change record as the benign rationale.\n- Flag the vulnerable driver to the owning team so the deployment package can be updated or the driver blocked at scale.\n- If the driver is loaded and exploitable, recommend remediation (update/remove) even though the source is trusted.\n- Propose tuning/suppression scoped to this deployment so sanctioned pushes don't re-alert.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Vulnerable driver traced to a sanctioned IT deployment; benign. Flagged for package update / blocklisting and tuning proposed."
+    },
+
+    "close-bundled": {
+      "type": "terminal",
+      "title": "Close — bundled with legitimate software",
+      "instructions": "The driver ships with a sanctioned/known application. Close and reduce future noise.\n\n- Document the parent application and that the driver is a known component of it.\n- Note the standing risk: a legitimately-installed vulnerable driver is still abusable, so record whether the fleet should move to a fixed version or blocklist the driver.\n- Propose tuning scoped to this application/driver pairing.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Vulnerable driver is a known component of legitimate bundled software; benign. Standing-exposure note filed and tuning proposed."
+    },
+
+    "close-outdated": {
+      "type": "terminal",
+      "title": "Close — legitimate app, outdated driver, no malicious intent",
+      "instructions": "A real user install of a legitimate application carrying an old/vulnerable driver version, with no sign of malicious intent. Close with a hygiene follow-up.\n\n- Document the application, the outdated driver version, and the absence of malicious behavior.\n- Recommend updating the application/driver to a non-vulnerable version, or removing it if unneeded.\n- If organizationally warranted, raise for vulnerable-driver blocklisting so the old version can't be abused fleet-wide.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Legitimate application with an outdated vulnerable driver; no malicious intent. Update/removal recommended."
+    },
+
+    "loaded-check-mal": {
+      "type": "step",
+      "title": "Determine driver load state and abuse indicators",
+      "instructions": "The writer is malicious/suspicious. Establish whether the vulnerable driver was loaded and whether it has been abused, as this drives containment urgency.\n\n- Determine whether the driver was loaded into the kernel and whether it remains loaded.\n- Look for BYOVD abuse behavior around the load: security tooling being tampered with or stopped, protected-process access, driver-service creation, or kernel-level actions.\n- Identify any privilege escalation or follow-on activity by the writer's tree (new persistence, credential access, lateral movement attempts).\n- Preserve volatile evidence (running processes, loaded modules, memory artifacts) before it is lost.",
+      "evidence": [
+        {"id": "load-state", "label": "Loaded? (when / still loaded)", "type": "textarea"},
+        {"id": "abuse", "label": "BYOVD abuse indicators (tamper / PPL / kernel actions)", "type": "textarea"},
+        {"id": "followon", "label": "Escalation / persistence / lateral movement", "type": "textarea"}
+      ],
+      "next": "contain"
+    },
+
+    "contain": {
+      "type": "step",
+      "title": "Contain the host",
+      "instructions": "Credible malicious BYOVD activity. Contain before eradication and handoff.\n\n- Isolate the affected host from the network per policy while preserving investigative access.\n- Block the malicious driver and writer by hash across the fleet, and unload the driver where supported.\n- Disable or quarantine any malicious service/persistence created around the driver.\n- Record every containment action and its timestamp.",
+      "evidence": [
+        {"id": "isolation", "label": "Host isolation (action / time)", "type": "text"},
+        {"id": "blocks", "label": "Hash/driver blocks & unload actions", "type": "textarea"},
+        {"id": "persist-removed", "label": "Persistence/service disabled", "type": "textarea"}
+      ],
+      "next": "scope",
+      "playbook": "CONTAINMENT"
+    },
+
+    "scope": {
+      "type": "step",
+      "title": "Scope the blast radius",
+      "instructions": "Determine how far the activity reached before handoff.\n\n- Search the fleet for the same driver hash and writer hash on other hosts.\n- Build a timeline from first-seen to latest activity across affected hosts.\n- Assess what the compromised host/account could reach (data, credentials, adjacent systems).\n- Note any evidence of successful privilege escalation or lateral movement identified during containment.",
+      "evidence": [
+        {"id": "affected", "label": "All affected hosts / accounts", "type": "textarea"},
+        {"id": "timeline", "label": "First-seen → latest activity", "type": "textarea"},
+        {"id": "exposure", "label": "Reachable data / systems / credentials", "type": "textarea"}
+      ],
+      "next": "escalate",
+      "playbook": "SCOPING"
+    },
+
+    "escalate": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "Confirmed malicious BYOVD with scope and initial containment established. Hand off with a complete package.\n\n- Ensure host, driver, writer, load/abuse indicators, timeline, affected assets, and containment actions are all recorded above.\n- Assign incident severity per your matrix and notify the on-call IR owner.\n- Confirm volatile evidence was preserved before any remediation that would destroy it.\n- Transfer ownership; eradication and recovery proceed under the IR playbook.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Confirmed malicious vulnerable-driver (BYOVD) activity; host contained, scoped, and escalated to IR."
+    }
+  }
+}
