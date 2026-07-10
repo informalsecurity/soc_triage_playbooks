@@ -1,21 +1,21 @@
 {
   "id": "proc-umbrella-multiple-malicious-dns",
   "title": "Multiple Malicious DNS Resolutions",
-  "version": "1.0",
+  "version": "2.0",
   "detectionType": "DNS / Umbrella — bulk resolutions in risky categories",
   "severityDefault": "medium",
-  "description": "A host or user generated a high volume (e.g. 25+ within one hour) of DNS resolutions falling into risky categories — Malware, Command-and-Control, Botnet, Newly Seen Domains, or Phishing. The intent is to catch threats that endpoint detection may have missed (a payload that evaded CrowdStrike but still reaches out to threat-intel-known or newly-seen infrastructure), while acknowledging that bulk risky resolutions are frequently benign (ad/analytics/CDN sprawl, a single page loading many trackers, newly-registered legitimate domains). The core of triage is attributing the resolutions to an originating process, which requires cross-referencing Umbrella (what was resolved) with the endpoint detection platform (what process resolved it) and identity logs where a user/egress IP is involved. A fallback path handles cases where the originating system is not managed by the endpoint platform.",
+  "description": "A host or user generated a high volume (e.g. 25+ within one hour) of DNS resolutions falling into risky categories — Malware (including Botnet and Command-and-Control), Cryptomining, Newly Seen Domains, or Phishing. CORE PRINCIPLE: a block is telemetry, not resolution. Even when Umbrella blocked every resolution, the attempt itself can be the only visible indicator of a payload CrowdStrike missed, an infected device that has no sensor at all, or a user interaction (click, download, mobile-device click) that our controls only partially covered. Triage therefore does two things: (1) attribute the resolutions to an originating process by cross-referencing Umbrella (what was resolved) with CrowdStrike (what resolved it), and (2) review the surrounding activity window even when the domain was blocked. The key concern signals are: a NON-BROWSER process that CONTINUES to resolve/beacon to the domain (ongoing, not one-off), unexplained cryptomining executables, and blocked phishing/newly-seen domains with secondary domains or suspicious file downloads around the same time. One-off resolutions or browser-originated resolutions are lower concern — we hand those to the desktop tech to track down, assisting with identification where our telemetry allows. A fallback path handles hosts not managed by CrowdStrike, which is itself one of the two infection scenarios this alert exists to catch.",
   "startNode": "intake",
   "nodes": {
     "intake": {
       "type": "step",
       "title": "Intake and capture the resolution set",
-      "instructions": "Confirm this is a new alert (not a duplicate) and capture what the DNS layer actually saw.\n\n- Record the identifier Umbrella attributes the activity to: internal host, roaming client, network/egress public IP, or a username if tied to a directory.\n- Export the list of flagged resolutions with their categories, timestamps, and counts per category.\n- Note the category mix: is it dominated by Newly Seen Domains, by Malware/C2/Botnet, by Phishing, or a blend.\n- Note the time window and whether the resolutions are clustered (a burst) or spread evenly (possible beaconing).\n- Record the reporting source and alert time.",
+      "instructions": "Confirm this is a new alert (not a duplicate) and capture what the DNS layer actually saw. Do NOT deprioritize just because resolutions were blocked — blocked telemetry is still an indicator and drives most of this playbook.\n\n- Record the identifier Umbrella attributes the activity to: internal host, roaming client, network/egress public IP, or a username if tied to a directory.\n- Export the list of flagged resolutions with their categories, timestamps, counts per category, and — critically — the Umbrella action per resolution (Blocked vs Allowed). Allowed resolutions to bad categories raise urgency immediately.\n- Note the category mix: Malware/C2/Botnet, Cryptomining, Phishing, Newly Seen Domains, or a blend. Each category has its own branch later.\n- Note the time window and pattern: clustered burst (typical of a page load or single click) vs even/periodic spacing (possible beaconing). ONGOING/repeating resolutions over hours or days are a primary concern signal; a one-off cluster is lower concern.\n- Record the reporting source and alert time.",
       "evidence": [
         {"id": "attribution", "label": "Umbrella attribution (host / roaming client / egress IP / user)", "type": "textarea"},
-        {"id": "resolutions", "label": "Flagged domains, categories, counts", "type": "textarea"},
-        {"id": "mix", "label": "Category mix (NSD-heavy / malware-C2 / phishing / blend)", "type": "text"},
-        {"id": "pattern", "label": "Timing: burst vs. even/periodic", "type": "text"}
+        {"id": "resolutions", "label": "Flagged domains, categories, counts, Blocked vs Allowed per domain", "type": "textarea"},
+        {"id": "mix", "label": "Category mix (malware-C2-botnet / cryptomining / phishing / NSD / blend)", "type": "text"},
+        {"id": "pattern", "label": "Timing: one-off burst vs ONGOING/periodic (beaconing?)", "type": "text"}
       ],
       "next": "triage-domains"
     },
@@ -23,11 +23,13 @@
     "triage-domains": {
       "type": "step",
       "title": "Enrich and separate the domains",
-      "instructions": "Not all flagged domains carry equal weight. Enrich them before touching the host.\n\n- For each distinctive domain, gather reputation and any known campaign/malware/phishing affiliation from a threat-intel capability.\n- Separate the set into buckets: (a) credible malicious infrastructure (known C2/malware/botnet or convincing phishing), (b) newly-seen/low-info domains with no clear verdict, and (c) obvious ad/analytics/tracker/CDN or otherwise benign-but-noisy domains.\n- For Newly Seen Domains, check registration age and whether they resemble legitimate new services vs. algorithmically-generated names (DGA-like).\n- Note whether any domain is a lookalike/typosquat of a brand your users would trust (phishing signal).",
+      "instructions": "Not all flagged domains carry equal weight. Enrich them before touching the host.\n\n- For each distinctive domain, gather reputation and any known campaign/malware/phishing affiliation from a threat-intel capability (Umbrella Investigate, VirusTotal, urlscan.io, abuse.ch URLhaus/ThreatFox are good free/low-friction options).\n- Separate the set into buckets: (a) credible malicious infrastructure (known C2/malware/botnet or convincing phishing), (b) cryptomining infrastructure (mining pools, stratum endpoints, coinhive-style scripts), (c) newly-seen/low-info domains with no clear verdict, and (d) obvious ad/analytics/tracker/CDN or otherwise benign-but-noisy domains.\n- For Newly Seen Domains, check registration age (WHOIS/RDAP) and whether they resemble legitimate new services vs algorithmically-generated names (DGA-like).\n- Note whether any domain is a lookalike/typosquat of a brand your users would trust (phishing signal).\n- Where visible, note likely SOURCE hints for the resolution — referrer chains in proxy logs, an email link, a web redirect, malvertising. Source matters later for control tuning.",
       "evidence": [
-        {"id": "malicious-bucket", "label": "Credible malicious domains (intel-backed)", "type": "textarea"},
+        {"id": "malicious-bucket", "label": "Credible malicious domains: malware / C2 / botnet / phishing (intel-backed)", "type": "textarea"},
+        {"id": "crypto-bucket", "label": "Cryptomining domains (pools / stratum / in-browser miners)", "type": "textarea"},
         {"id": "unknown-bucket", "label": "Newly-seen / unresolved domains (age, DGA-like?)", "type": "textarea"},
-        {"id": "benign-bucket", "label": "Ad / analytics / CDN / benign-noisy domains", "type": "textarea"}
+        {"id": "benign-bucket", "label": "Ad / analytics / CDN / benign-noisy domains", "type": "textarea"},
+        {"id": "source-hints", "label": "Likely source of resolutions (email link / redirect / ad / unknown)", "type": "textarea"}
       ],
       "next": "host-identified?"
     },
@@ -67,46 +69,121 @@
     "in-edr?": {
       "type": "decision",
       "title": "Is the identified host managed by the endpoint detection platform (CrowdStrike)?",
-      "instructions": "This determines whether process-level attribution is even possible. Managed workstations/servers with the sensor allow you to tie a DNS resolution to a process. Unmanaged, BYOD, IoT/OT, printers, or guest devices do not.",
+      "instructions": "This determines which of the two infection scenarios you may be in. Scenario 1: the host HAS the sensor, so a real infection means a payload CrowdStrike missed — process attribution should be straightforward via Falcon event search. Scenario 2: the host has NO sensor (unmanaged, BYOD, IoT/OT, printer, guest), so an infection is invisible at the process level and the case must be built from network/DNS/user evidence — treat this path with MORE suspicion, not less, because it is exactly the coverage gap this alert exists to catch.",
       "options": [
-        {"label": "Yes — host has the sensor", "next": "edr-process", "note": "Pivot to the endpoint platform for process attribution."},
-        {"label": "No — unmanaged / BYOD / IoT / no sensor", "next": "no-edr-branch", "note": "No process attribution; use network + user evidence."}
+        {"label": "Yes — host has the sensor (Scenario 1: possible missed payload)", "next": "edr-process", "note": "Pivot to CrowdStrike for process attribution."},
+        {"label": "No — unmanaged / BYOD / IoT / no sensor (Scenario 2: blind spot)", "next": "no-edr-branch", "note": "No process attribution; use network + user evidence."}
       ]
     },
 
     "edr-process": {
       "type": "step",
-      "title": "Attribute the resolutions to a process in the endpoint platform",
-      "instructions": "Pivot from Umbrella (what was resolved) to the endpoint platform (what resolved it). This is the decisive step.\n\n- Search the host's endpoint telemetry around the Umbrella timestamps for DNS request / network events matching the flagged domains.\n- Identify the initiating process for the resolutions: a browser or Explorer/shell, a known application, or an unexpected binary (script host, LOLBin, unsigned/renamed executable, something in a user-writable/temp path).\n- For any suspicious process, capture its path, signature, parent process, and reputation, and note whether the endpoint platform itself raised any related (possibly lower-severity or suppressed) detections.\n- Determine whether the resolutions map to user-driven browsing (many domains loaded by one page) or to autonomous process activity (periodic callbacks independent of user action).",
+      "title": "Attribute the resolutions to a process in CrowdStrike",
+      "instructions": "Pivot from Umbrella (what was resolved) to CrowdStrike (what resolved it). This is the decisive step, and the two questions that matter most are: (1) is the initiating process a WEB BROWSER or not, and (2) is the activity ONGOING or a one-off?\n\n- Search the host's Falcon telemetry (Advanced Event Search, DnsRequest events) around the Umbrella timestamps for DNS request / network events matching the flagged domains.\n- Identify the initiating process: a browser or Explorer/shell, a known application, or an unexpected binary (script host, LOLBin, unsigned/renamed executable, something in a user-writable/temp path).\n- For any suspicious process, capture its path, signature, parent process, command line, and reputation (hash lookup in VirusTotal / Hybrid Analysis), and note whether Falcon itself raised any related (possibly lower-severity or suppressed) detections.\n- Establish cadence: query a WIDER window (days, not just the alert hour). A non-browser process that CONTINUES to resolve/beacon to the domain over time is the primary threat signal. A single cluster that never recurs is a one-off.\n- Determine whether the resolutions map to user-driven browsing (many domains loaded by one page, browser process, coincides with user session) or to autonomous process activity (periodic callbacks independent of user logon/activity).\n- Be honest about telemetry limits: if Falcon simply did not record the resolutions (sensor gap, event roll-off), note it — you may only be able to partially assist identification.",
       "evidence": [
-        {"id": "process", "label": "Initiating process (path / signer / parent)", "type": "textarea"},
-        {"id": "process-class", "label": "Browser/shell vs. unexpected binary; reputation", "type": "textarea"},
-        {"id": "driver", "label": "User-driven browsing vs. autonomous callbacks", "type": "textarea"},
-        {"id": "edr-related", "label": "Related endpoint detections (even suppressed)?", "type": "text"}
+        {"id": "process", "label": "Initiating process (path / signer / parent / cmdline / hash)", "type": "textarea"},
+        {"id": "process-class", "label": "BROWSER vs NON-BROWSER binary; reputation", "type": "textarea"},
+        {"id": "cadence", "label": "ONGOING/recurring vs one-off (wider-window search results)", "type": "textarea"},
+        {"id": "driver", "label": "User-driven browsing vs autonomous callbacks", "type": "textarea"},
+        {"id": "edr-related", "label": "Related Falcon detections (even suppressed)? Telemetry gaps?", "type": "text"}
       ],
       "next": "process-verdict?"
     },
 
     "process-verdict?": {
       "type": "decision",
-      "title": "What does the initiating process indicate?",
-      "instructions": "Combine the process identity with the domain buckets. An unexpected/unsigned binary or autonomous callbacks to malicious infrastructure indicates a missed infection. A browser resolving the domains points to user activity — which is either a phishing click or benign browsing depending on the domains. If the process itself looks fine but resolved credible malicious domains, keep it as suspicious and investigate the malicious branch.",
+      "title": "What do the process, category, and cadence indicate?",
+      "instructions": "Combine three things: WHAT process resolved the domains (browser vs not), WHAT category the domains fall in, and WHETHER it is ongoing. Rules of thumb: a NON-BROWSER process with ONGOING resolutions to malware/C2/botnet infrastructure is a likely missed infection — investigate fully. An unexplained standalone cryptomining executable is a post-exploitation indicator — investigate. A ONE-OFF resolution, or resolutions originating from a browser, is lower concern — hand to the desktop tech to track down, assisting with identification where telemetry allows. Blocked phishing or newly-seen domains still require a surrounding-activity review before closing — a block on the primary domain does not prove a secondary domain wasn't used or a file wasn't downloaded.",
       "options": [
-        {"label": "Suspicious process / autonomous callbacks to bad infra", "next": "malware-confirm", "note": "Likely payload that evaded the endpoint platform."},
-        {"label": "Browser/user resolved credible PHISHING domains", "next": "phishing-branch", "note": "Possible phishing click; check email & credentials."},
-        {"label": "Browser/user resolved ad/CDN/newly-seen NOISE only", "next": "benign-browsing", "note": "Likely benign browsing / adtech sprawl."}
+        {"label": "NON-BROWSER process, ONGOING callbacks to malware/C2/botnet domains", "next": "malware-confirm", "note": "Likely payload that evaded CrowdStrike. Full investigation."},
+        {"label": "Cryptomining domains resolved by a standalone (non-browser) executable", "next": "crypto-investigate", "note": "Possible post-exploit miner. Determine if explained."},
+        {"label": "One-off resolution OR browser-origin to malware/crypto domains", "next": "assist-tech-id", "note": "Lower concern. Best-effort ID, then hand to tech."},
+        {"label": "Browser/user resolved credible PHISHING domains", "next": "phishing-branch", "note": "Possible phishing click; check email, credentials, and surrounding activity."},
+        {"label": "NEWLY SEEN DOMAINS dominate (blocked or not)", "next": "surrounding-activity-review", "note": "Even if blocked: review secondary domains, source, downloads, mobile click."},
+        {"label": "Browser/user resolved ad/CDN/tracker NOISE only", "next": "benign-browsing", "note": "Likely benign browsing / adtech sprawl."}
+      ]
+    },
+
+    "assist-tech-id": {
+      "type": "step",
+      "title": "Best-effort identification for tech handoff (one-off / browser-origin)",
+      "instructions": "The resolution is a one-off or originated from a web browser, so it does not indicate an active implant — but we should still try to help the desktop tech identify the cause before handing off. We may not have the telemetry to pin it down; do what the data allows and be explicit about gaps.\n\n- If browser-origin: pull what context exists — the page/referrer that triggered the resolution (proxy logs, Umbrella Investigate co-occurrence, urlscan.io of the domain to see what embeds it). A malvertising chain or compromised legitimate site is worth noting for the tech and for potential blocking.\n- If one-off non-browser: capture the process details you DO have (even partial), the exact timestamp, and check whether it correlates with a software install, an updater, or a scheduled task around that time.\n- Confirm in a wider Falcon/Umbrella search that the activity has NOT recurred since the alert. If it recurs during triage, this is no longer a one-off — return to the malware path.\n- Package findings for the tech: host, user, timestamp, domain(s), suspected origin, and specifically what you could NOT determine and why (telemetry gap).",
+      "evidence": [
+        {"id": "origin-context", "label": "Origin context found (referrer / embedding page / install / updater)", "type": "textarea"},
+        {"id": "recurrence-check", "label": "Recurrence check across wider window (confirmed no repeat?)", "type": "textarea"},
+        {"id": "tech-package", "label": "Handoff package for tech (incl. explicit telemetry gaps)", "type": "textarea"}
+      ],
+      "next": "recurrence-verdict?"
+    },
+
+    "recurrence-verdict?": {
+      "type": "decision",
+      "title": "Did the wider-window check confirm this is truly a one-off?",
+      "instructions": "The one-off/browser classification only holds if the activity does not repeat. If your wider search shows the same host continuing to resolve the same bad domains, treat it as ongoing and pivot back to the malware path regardless of the initial classification.",
+      "options": [
+        {"label": "Confirmed one-off / browser-origin, no recurrence", "next": "close-tech-handoff", "note": "Hand to tech with the package; close with reopen conditions."},
+        {"label": "Activity IS recurring — reclassify as ongoing", "next": "malware-confirm", "note": "Ongoing beaconing. Investigate as missed infection."}
+      ]
+    },
+
+    "crypto-investigate": {
+      "type": "step",
+      "title": "Investigate the cryptomining executable",
+      "instructions": "Threat actors frequently drop cryptomining software post-exploitation, so an unexplained miner is treated as an indicator of compromise — not a nuisance. What we are looking for is an UNEXPLAINED standalone mining executable. We do NOT care about a user speculating on crypto in their browser, and browser-process resolutions of mining domains are not a security concern (close them out; note in-browser miner scripts on sketchy sites for tuning at most).\n\n- Identify the mining process in Falcon: binary path, hash, signer, parent, command line (miners often expose pool/wallet in the command line — capture it). Common families: XMRig and derivatives; check the hash against VirusTotal.\n- Establish cadence: mining is economically pointless as a one-off — a real miner runs ONGOING. Confirm sustained resolutions/connections to pool infrastructure over the wider window, and note CPU/GPU-heavy execution if visible.\n- Determine how it arrived: installer, dropped by another process, scheduled task, service. A dropper/lateral arrival is a strong post-exploit indicator and should be treated as a broader compromise, not just a miner.\n- Determine INTENT: ask the user directly whether they installed mining software, OR ask the desktop tech to ask the user — and set a concrete follow-up date on the ticket so this does not silently expire. Hold the ticket open until the answer comes back.\n- 'The user installed it on purpose' explains the binary but may still violate acceptable use on a corporate asset — that goes to the policy close, not the security close.",
+      "evidence": [
+        {"id": "miner-details", "label": "Miner binary (path / hash / signer / cmdline incl. pool & wallet)", "type": "textarea"},
+        {"id": "miner-cadence", "label": "Ongoing execution / pool connections confirmed (wider window)", "type": "textarea"},
+        {"id": "miner-arrival", "label": "Arrival vector (installer / dropped / scheduled task / lateral)", "type": "textarea"},
+        {"id": "user-intent", "label": "User / tech follow-up: did the user install it? (date asked, date answered)", "type": "textarea"}
+      ],
+      "next": "crypto-verdict?"
+    },
+
+    "crypto-verdict?": {
+      "type": "decision",
+      "title": "Is the mining software explained?",
+      "instructions": "An unexplained miner — the user denies installing it, nobody can account for it, or the follow-up goes unanswered — is treated as a post-exploitation indicator and investigated as a compromise. If the arrival vector already shows a dropper or lateral movement, go to the malware path regardless of what the user says. Browser-based mining resolutions are not a security concern. Intentional user mining on a corporate asset is a policy matter, not an incident.",
+      "options": [
+        {"label": "UNEXPLAINED miner (user denies / no answer / dropper or lateral arrival)", "next": "malware-confirm", "note": "Treat as post-exploit compromise. Contain, scope, escalate."},
+        {"label": "User intentionally installed miner on corporate asset", "next": "close-policy", "note": "Not a security incident; acceptable-use referral. Remove software."},
+        {"label": "Browser-process only (in-browser miner script / crypto browsing)", "next": "close-fp", "note": "Not a concern. Optionally note the hosting site for blocking."}
+      ]
+    },
+
+    "surrounding-activity-review": {
+      "type": "step",
+      "title": "Review activity AROUND the flagged resolutions (required even when blocked)",
+      "instructions": "This step applies to Newly Seen Domains and to blocked Phishing domains alike. A block on the flagged domain proves only that ONE resolution was denied — it does not prove the user wasn't redirected to a secondary domain that was allowed, didn't download a file, or didn't complete the same click on an unprotected device. Perform all four checks:\n\n1. SECONDARY DOMAINS: pull the host's full Umbrella resolution log for a window around the flagged resolutions (suggest ±30 minutes, widen if suspicious). Look for other newly-seen, low-reputation, or lookalike domains that were ALLOWED — attackers rotate infrastructure, and the blocked domain is often only one node of a redirect chain. Enrich anything suspicious (urlscan.io will often show the redirect chain).\n2. SOURCE OF THE DOMAIN: determine how the user reached it — email link (correlate with email security for the delivering message and other recipients), web redirect/malvertising, search result, document link. The source decides whether a CONTROL NEEDS TUNING: an email-delivered link that reached the user means email filtering missed it; a malvertising chain may warrant category or destination blocks. Record the tuning recommendation explicitly.\n3. HOST TIMELINE FOR DOWNLOADS: review the CrowdStrike host timeline around the window for file writes/downloads — archives, executables, script files, ISO/IMG, or Office docs from the web. Anything downloaded near the flagged resolution gets hash-checked and, if it executed, pivots this investigation immediately.\n4. USER FOLLOW-UP (MOBILE GAP): where a user is associated, ask them (directly or via the tech) what they clicked and whether they also opened the link on their PHONE or another personal device — Umbrella does not protect unmanaged mobile devices, so the block you see on the corporate host may not have protected the same click elsewhere. If they entered credentials anywhere, treat as phishing exposure.",
+      "evidence": [
+        {"id": "secondary-domains", "label": "Other domains resolved ±window (any ALLOWED suspicious/secondary infra?)", "type": "textarea"},
+        {"id": "domain-source", "label": "Source of domain (email / redirect / ad / search) + control tuning needed?", "type": "textarea"},
+        {"id": "download-timeline", "label": "Host timeline: file downloads/writes around the window (hashes checked)", "type": "textarea"},
+        {"id": "user-followup", "label": "User follow-up incl. mobile/personal-device click and credential entry", "type": "textarea"}
+      ],
+      "next": "review-verdict?"
+    },
+
+    "review-verdict?": {
+      "type": "decision",
+      "title": "Did the surrounding-activity review find follow-through?",
+      "instructions": "Route on what the four checks found. A downloaded file that executed, or ongoing contact with secondary infrastructure, means the block did not actually stop the attack — investigate as a compromise. Credential entry anywhere (including on a phone) is an identity exposure — investigate as phishing. If all four checks are clean, the block did its job; close with the tuning recommendations and user-education notes captured.",
+      "options": [
+        {"label": "File downloaded/executed OR secondary infra contacted (esp. non-browser/ongoing)", "next": "malware-confirm", "note": "Block was bypassed in practice. Investigate as compromise."},
+        {"label": "Credential entry suspected/confirmed (any device, incl. phone)", "next": "phishing-branch", "note": "Identity exposure path — verify and check Okta."},
+        {"label": "All checks clean — block held, no follow-through", "next": "close-blocked-no-impact", "note": "Close with tuning recommendations documented."}
       ]
     },
 
     "no-edr-branch": {
       "type": "step",
-      "title": "Investigate without endpoint process attribution",
-      "instructions": "The host has no sensor, so you cannot see the initiating process. Build the case from network, DNS, and user evidence instead.\n\n- Characterize the device: what it is (BYOD laptop, phone, IoT/OT, printer, server), who owns/uses it, and what it is normally expected to do on the network.\n- Analyze the DNS pattern itself: periodic/beaconing cadence and DGA-like names suggest automated malware; a burst of mixed ad/tracker domains suggests browsing.\n- Gather any available network evidence: firewall/proxy/NetFlow showing whether connections actually followed the resolutions, to which destinations, and data volume.\n- If a user is associated, review identity logs (Okta) for suspicious authentication around the window and interview the user about their activity.",
+      "title": "Investigate without endpoint process attribution (Scenario 2: no sensor)",
+      "instructions": "The host has no CrowdStrike sensor, so you cannot see the initiating process — and an infected unmanaged device is exactly the second scenario this alert exists to catch. Do not downgrade for lack of visibility; build the case from network, DNS, and user evidence.\n\n- Characterize the device: what it is (BYOD laptop, phone, IoT/OT, printer, server), who owns/uses it, and what it is normally expected to do on the network. Should this device even be resolving these categories?\n- Analyze the DNS pattern itself: ONGOING periodic/beaconing cadence and DGA-like names suggest automated malware; a single burst of mixed ad/tracker domains suggests browsing. Query a wider window (days) — persistence over time is the strongest signal you have without a sensor.\n- For cryptomining categories: sustained resolutions to mining pools from a server, IoT device, or any host with no interactive user is a strong compromise indicator (no browser to blame it on).\n- Gather any available network evidence: firewall/proxy/NetFlow showing whether connections actually followed the resolutions, to which destinations, and data volume.\n- If a user is associated, review identity logs (Okta) for suspicious authentication around the window and interview the user about their activity.\n- Flag the sensor gap itself: if this is a corporate asset that SHOULD have CrowdStrike, getting the sensor installed is both a remediation and the fastest path to a definitive answer.",
       "evidence": [
-        {"id": "device-nature", "label": "Device type / owner / expected behavior", "type": "textarea"},
-        {"id": "dns-pattern", "label": "DNS pattern analysis (beaconing? DGA-like?)", "type": "textarea"},
+        {"id": "device-nature", "label": "Device type / owner / expected behavior (should it resolve these?)", "type": "textarea"},
+        {"id": "dns-pattern", "label": "DNS pattern analysis: ONGOING beaconing? DGA-like? Mining pools?", "type": "textarea"},
         {"id": "netflow", "label": "Firewall/proxy/NetFlow follow-through evidence", "type": "textarea"},
-        {"id": "user-evidence", "label": "Okta / user interview findings", "type": "textarea"}
+        {"id": "user-evidence", "label": "Okta / user interview findings", "type": "textarea"},
+        {"id": "sensor-gap", "label": "Sensor coverage gap (corporate asset missing CrowdStrike?)", "type": "text"}
       ],
       "next": "no-edr-verdict?"
     },
@@ -114,11 +191,11 @@
     "no-edr-verdict?": {
       "type": "decision",
       "title": "What does the network/DNS/user evidence indicate?",
-      "instructions": "Without process attribution, weigh the strongest available signals: pattern shape, follow-through connections, domain reputation, and user account. Err toward caution when malicious infrastructure was contacted and connections followed.",
+      "instructions": "Without process attribution, weigh the strongest available signals: pattern shape (ongoing beaconing is decisive), follow-through connections, domain reputation, and user account. Err toward caution when malicious or mining infrastructure was contacted repeatedly — on an unmanaged host you cannot rule out an implant, and this blind spot is the scenario the alert exists for.",
       "options": [
-        {"label": "Automated callbacks to malicious infra — likely infection", "next": "malware-confirm", "note": "Treat as compromised despite no sensor."},
-        {"label": "Phishing domains + user activity", "next": "phishing-branch", "note": "Investigate as phishing click."},
-        {"label": "Benign browsing / adtech / device noise", "next": "benign-browsing", "note": "No malicious follow-through."},
+        {"label": "ONGOING automated callbacks to malicious/mining infra — likely infection", "next": "malware-confirm", "note": "Treat as compromised despite no sensor."},
+        {"label": "Phishing or newly-seen domains + user activity", "next": "surrounding-activity-review", "note": "Run the surrounding-activity review (secondary domains, source, downloads, mobile)."},
+        {"label": "Benign browsing / adtech / device noise (one-off)", "next": "benign-browsing", "note": "No malicious follow-through."},
         {"label": "Cannot determine — insufficient visibility", "next": "no-host-branch", "note": "Escalate for visibility / deeper collection."}
       ]
     },
@@ -126,7 +203,7 @@
     "no-host-branch": {
       "type": "step",
       "title": "Handle unresolved attribution",
-      "instructions": "You cannot pin the activity to a specific host, or you lack the visibility to reach a verdict. Do not simply close — the alert may reflect a real infection you cannot yet see.\n\n- Document exactly what attribution you DO have (egress IP, network segment, time window, user candidates).\n- Take proportionate protective action: block/sinkhole the credible malicious domains at the DNS/network layer so any affected host is denied resolution while you investigate.\n- Note what visibility gap prevented attribution (unmanaged segment, NAT with insufficient logging, missing sensor coverage) as a coverage improvement item.\n- Decide whether the malicious-domain evidence is strong enough to escalate for broader hunting, or whether it can be monitored.",
+      "instructions": "You cannot pin the activity to a specific host, or you lack the visibility to reach a verdict. Do not simply close — the alert may reflect a real infection you cannot yet see, and blocked telemetry from an invisible host is still telemetry.\n\n- Document exactly what attribution you DO have (egress IP, network segment, time window, user candidates).\n- Take proportionate protective action: block/sinkhole the credible malicious domains at the DNS/network layer so any affected host is denied resolution while you investigate.\n- Note what visibility gap prevented attribution (unmanaged segment, NAT with insufficient logging, missing sensor coverage) as a coverage improvement item.\n- Set a monitoring condition: if the same domains are resolved again from this egress/segment, the alert reopens with the timing data needed to narrow the host.\n- Decide whether the malicious-domain evidence is strong enough to escalate for broader hunting, or whether it can be monitored.",
       "evidence": [
         {"id": "known-attribution", "label": "Attribution available (IP / segment / candidates)", "type": "textarea"},
         {"id": "protective", "label": "Protective action taken (domain block/sinkhole)", "type": "textarea"},
@@ -138,9 +215,9 @@
     "no-host-verdict?": {
       "type": "decision",
       "title": "Is the malicious-domain evidence strong enough to escalate?",
-      "instructions": "Even without a host, credible contact with known-bad infrastructure may justify escalation for broader hunting; weak/benign evidence can be monitored and closed with a coverage note.",
+      "instructions": "Even without a host, credible ongoing contact with known-bad infrastructure may justify escalation for broader hunting; weak/benign evidence can be monitored and closed with a coverage note.",
       "options": [
-        {"label": "Strong — credible malicious infra contacted", "next": "escalate-threat", "note": "Escalate for hunting despite no host."},
+        {"label": "Strong — credible malicious infra contacted (esp. ongoing)", "next": "escalate-threat", "note": "Escalate for hunting despite no host."},
         {"label": "Weak / benign — monitor and close", "next": "close-unresolved", "note": "Protective block + coverage note; close."}
       ]
     },
@@ -148,11 +225,11 @@
     "malware-confirm": {
       "type": "step",
       "title": "Confirm and characterize the suspected infection",
-      "instructions": "Evidence points to malware that endpoint detection missed or that is running on an unmonitored host. Pin down what you are dealing with before containment.\n\n- Confirm the malicious nature: match the process/domains to a known family or campaign where possible, and confirm connections followed the resolutions (actual C2/beaconing, not just lookups).\n- On a managed host, collect the payload details: file path(s), hash(es), persistence mechanism, and how it likely arrived (email, download, removable media, lateral).\n- Establish the beaconing timeline: first callback to latest, and cadence.\n- Preserve volatile evidence (running processes, network connections, memory artifacts) before remediation.",
+      "instructions": "Evidence points to malware (including botnet/C2 implants or post-exploit cryptominers) that CrowdStrike missed, or that is running on an unmonitored host. Pin down what you are dealing with before containment.\n\n- Confirm the malicious nature: match the process/domains to a known family or campaign where possible (VirusTotal, Hybrid Analysis, ThreatFox, vendor intel), and confirm connections actually followed the resolutions (real C2/beaconing or pool traffic, not just lookups).\n- On a managed host, collect the payload details: file path(s), hash(es), persistence mechanism (run keys, scheduled tasks, services), and how it likely arrived (email, download, removable media, lateral). For miners, capture the pool and wallet from the command line — useful for scoping and attribution.\n- Establish the beaconing timeline: first callback to latest, and cadence. The ONGOING nature is what confirmed this branch — document it.\n- Preserve volatile evidence (running processes, network connections, memory artifacts — Falcon RTR where available) before remediation.",
       "evidence": [
-        {"id": "family", "label": "Family/campaign match & C2 follow-through", "type": "textarea"},
-        {"id": "payload", "label": "Payload path/hash/persistence/arrival vector", "type": "textarea"},
-        {"id": "beacon-timeline", "label": "Beaconing timeline & cadence", "type": "textarea"}
+        {"id": "family", "label": "Family/campaign match & C2/pool follow-through", "type": "textarea"},
+        {"id": "payload", "label": "Payload path/hash/persistence/arrival vector (+ pool/wallet if miner)", "type": "textarea"},
+        {"id": "beacon-timeline", "label": "Beaconing timeline & cadence (first seen → latest)", "type": "textarea"}
       ],
       "next": "contain-host"
     },
@@ -160,10 +237,10 @@
     "contain-host": {
       "type": "step",
       "title": "Contain the host and infrastructure",
-      "instructions": "Credible infection. Contain before scoping and handoff.\n\n- Isolate the affected host from the network per policy while preserving investigative access; for an unmanaged host, use network-level isolation (switchport/NAC/segment block).\n- Sinkhole or block the malicious domains and known C2 IPs at the DNS and network layers across the environment.\n- Block the payload by hash on the endpoint platform where the host is managed.\n- Record every containment action with timestamps.",
+      "instructions": "Credible infection. Contain before scoping and handoff.\n\n- Isolate the affected host from the network per policy while preserving investigative access (Falcon network containment where managed); for an unmanaged host, use network-level isolation (switchport/NAC/segment block).\n- Sinkhole or block the malicious domains and known C2/pool IPs at the DNS and network layers across the environment.\n- Block the payload by hash on the endpoint platform where the host is managed.\n- Record every containment action with timestamps.",
       "evidence": [
         {"id": "isolation", "label": "Host isolation (managed or network-level) & time", "type": "textarea"},
-        {"id": "domain-block", "label": "Domain/C2 sinkhole & block actions", "type": "textarea"},
+        {"id": "domain-block", "label": "Domain/C2/pool sinkhole & block actions", "type": "textarea"},
         {"id": "hash-block", "label": "Payload hash block (if managed)", "type": "text"}
       ],
       "next": "scope-threat",
@@ -173,7 +250,7 @@
     "scope-threat": {
       "type": "step",
       "title": "Scope across the environment",
-      "instructions": "Determine how far the threat reached before handoff.\n\n- Query the DNS layer (Umbrella) for any OTHER hosts resolving the same malicious domains — this is often the fastest fleet-wide scoping signal.\n- On the endpoint platform, hunt the payload hash and related indicators across all managed hosts.\n- Build a cross-host timeline and identify any lateral movement or additional affected users/accounts (review Okta for suspicious auth tied to affected users).\n- Assess what data/systems the affected host(s) and account(s) could reach.",
+      "instructions": "Determine how far the threat reached before handoff.\n\n- Query the DNS layer (Umbrella) for any OTHER hosts resolving the same malicious/mining domains — this is often the fastest fleet-wide scoping signal, and it works even for hosts without a sensor.\n- On the endpoint platform, hunt the payload hash and related indicators across all managed hosts.\n- Build a cross-host timeline and identify any lateral movement or additional affected users/accounts (review Okta for suspicious auth tied to affected users).\n- Assess what data/systems the affected host(s) and account(s) could reach.\n- If this was a payload that evaded CrowdStrike, note the detection gap explicitly for the vendor/detection-engineering follow-up.",
       "evidence": [
         {"id": "other-hosts", "label": "Other hosts resolving same domains (Umbrella)", "type": "textarea"},
         {"id": "hash-hunt", "label": "Payload/indicator hunt across fleet (EDR)", "type": "textarea"},
@@ -186,21 +263,21 @@
     "escalate-threat": {
       "type": "terminal",
       "title": "Escalate to incident response",
-      "instructions": "Confirmed (or strongly suspected) malicious activity that endpoint detection did not stop, with initial containment and scope established. Hand off with a complete package.\n\n- Ensure attribution, domain enrichment, process/payload details, beaconing timeline, affected hosts/accounts, and containment actions are all recorded above.\n- Assign incident severity per your matrix and notify the on-call IR owner.\n- Confirm volatile evidence was preserved and DNS/identity logs retained before their retention windows expire.\n- Note this as a potential endpoint-detection gap for post-incident review.\n- Transfer ownership; eradication and recovery proceed under the IR playbook.",
+      "instructions": "Confirmed (or strongly suspected) malicious activity that endpoint detection did not stop, with initial containment and scope established. Hand off with a complete package.\n\n- Ensure attribution, domain enrichment, process/payload details, beaconing timeline, affected hosts/accounts, and containment actions are all recorded above.\n- Assign incident severity per your matrix and notify the on-call IR owner.\n- Confirm volatile evidence was preserved and DNS/identity logs retained before their retention windows expire.\n- Note this as a potential endpoint-detection gap (missed payload or missing sensor) for post-incident review.\n- Transfer ownership; eradication and recovery proceed under the IR playbook.",
       "disposition": "escalated",
       "playbook": "IR-HANDOFF",
-      "summary": "Bulk malicious DNS resolutions attributed to malware/C2 that endpoint detection missed; contained, scoped, and escalated to IR."
+      "summary": "Bulk malicious DNS resolutions attributed to malware/C2/miner activity that endpoint detection missed; contained, scoped, and escalated to IR."
     },
 
     "phishing-branch": {
       "type": "step",
       "title": "Investigate the suspected phishing click",
-      "instructions": "The resolutions include credible phishing domains reached via user/browser activity. Determine whether credentials were exposed.\n\n- Correlate with email security: find the message(s) delivering the phishing link, who received them, and who clicked (delivery/click telemetry).\n- Determine whether the user reached a credential-harvesting page and whether credentials were plausibly entered.\n- Review identity logs (Okta) for the affected user around and after the click: successful logins from unusual IPs, new MFA enrollment, MFA fatigue, or session anomalies indicating the harvested credentials were used.\n- Interview the user where feasible: did they enter credentials, approve an MFA prompt, or download anything.",
+      "instructions": "The resolutions include credible phishing domains reached via user/browser activity. Determine whether credentials were exposed. Remember: a BLOCK on the phishing domain is not the end of the investigation — the surrounding-activity review still applies before any close.\n\n- Correlate with email security: find the message(s) delivering the phishing link, who received them, and who clicked (delivery/click telemetry). The delivery source also feeds control tuning — if email filtering let it through, record that.\n- Determine whether the user reached a credential-harvesting page and whether credentials were plausibly entered.\n- Review identity logs (Okta) for the affected user around and after the click: successful logins from unusual IPs, new MFA enrollment, MFA fatigue, or session anomalies indicating the harvested credentials were used.\n- Interview the user where feasible: did they enter credentials, approve an MFA prompt, or download anything — and did they also open the link on their PHONE or a personal device that Umbrella does not protect. A block on the corporate host means nothing if the same click succeeded on their phone.",
       "evidence": [
-        {"id": "email", "label": "Delivering email(s), recipients, who clicked", "type": "textarea"},
+        {"id": "email", "label": "Delivering email(s), recipients, who clicked (+ filtering gap?)", "type": "textarea"},
         {"id": "harvest", "label": "Credential-harvest page reached / creds entered?", "type": "textarea"},
         {"id": "okta-post", "label": "Okta post-click anomalies (logins/MFA/session)", "type": "textarea"},
-        {"id": "user-account", "label": "User interview findings", "type": "textarea"}
+        {"id": "user-account", "label": "User interview incl. mobile/personal-device click", "type": "textarea"}
       ],
       "next": "phishing-verdict?"
     },
@@ -208,11 +285,11 @@
     "phishing-verdict?": {
       "type": "decision",
       "title": "Were credentials exposed or the account compromised?",
-      "instructions": "If credentials were entered or Okta shows post-click account misuse, treat as an identity compromise. If the user clicked but did not submit credentials and there is no account misuse, it is a contained phishing exposure. If it was blocked or never engaged, it trends toward false positive / benign.",
+      "instructions": "If credentials were entered (on ANY device, including a phone) or Okta shows post-click account misuse, treat as an identity compromise. If the user clicked but did not submit credentials and there is no account misuse, it is a contained phishing exposure. If the resolution was blocked or never engaged, do NOT close yet — run the surrounding-activity review to rule out secondary domains and file downloads around the same time.",
       "options": [
-        {"label": "Credentials exposed / account misused", "next": "contain-identity", "note": "Identity compromise — contain the account."},
+        {"label": "Credentials exposed / account misused (any device)", "next": "contain-identity", "note": "Identity compromise — contain the account."},
         {"label": "Clicked only, no credentials entered, no misuse", "next": "phishing-exposure-close", "note": "Contained exposure; harden and educate."},
-        {"label": "Blocked / not engaged — benign", "next": "close-fp", "note": "No exposure; close as false positive."}
+        {"label": "Blocked / not engaged", "next": "surrounding-activity-review", "note": "Blocked ≠ done: review secondary domains, downloads, source, mobile."}
       ]
     },
 
@@ -254,10 +331,11 @@
     "benign-browsing": {
       "type": "step",
       "title": "Confirm benign browsing / adtech before closing",
-      "instructions": "The resolutions look like ordinary browsing noise — many ad/analytics/tracker/CDN domains and newly-registered-but-legitimate services loaded by normal web activity. Confirm before closing.\n\n- Verify the initiating process (where available) is a legitimate browser and that the resolutions coincide with genuine user browsing.\n- Confirm none of the flagged domains carry credible malicious intel once enriched (newly-seen ≠ malicious).\n- Confirm there is no beaconing cadence and no autonomous non-browser process involved.\n- Note whether the volume is explained by a single content-heavy site or normal daily browsing.",
+      "instructions": "The resolutions look like ordinary browsing noise — many ad/analytics/tracker/CDN domains and newly-registered-but-legitimate services loaded by normal web activity. Confirm before closing.\n\n- Verify the initiating process (where available) is a legitimate browser and that the resolutions coincide with genuine user browsing.\n- Confirm none of the flagged domains carry credible malicious intel once enriched (newly-seen ≠ malicious).\n- Confirm there is no beaconing cadence and no autonomous non-browser process involved — a wider-window check that shows the resolutions recurring on a schedule invalidates the benign call.\n- Note whether the volume is explained by a single content-heavy site or normal daily browsing.",
       "evidence": [
         {"id": "browser-confirm", "label": "Legitimate browser + genuine browsing confirmed", "type": "textarea"},
         {"id": "no-intel", "label": "No credible malicious intel on domains", "type": "text"},
+        {"id": "no-recurrence", "label": "Wider-window check: no beaconing/recurrence", "type": "text"},
         {"id": "policy", "label": "Any acceptable-use/policy concern (non-malicious)?", "type": "text"}
       ],
       "next": "benign-verdict?"
@@ -266,7 +344,7 @@
     "benign-verdict?": {
       "type": "decision",
       "title": "Is this cleanly benign, or benign-but-policy-relevant?",
-      "instructions": "Distinguish pure false positive from activity that is not malicious but violates acceptable-use (e.g. the user visited disreputable sites, used prohibited services) and may warrant a note to management/HR without being a security incident.",
+      "instructions": "Distinguish pure false positive from activity that is not malicious but violates acceptable-use (e.g. the user visited disreputable sites, used prohibited services, or intentionally installed mining software on a corporate asset) and may warrant a note to management/HR without being a security incident.",
       "options": [
         {"label": "Cleanly benign — normal browsing/adtech", "next": "close-fp", "note": "False positive; tune the noisy categories/domains."},
         {"label": "Benign but policy-relevant activity", "next": "close-policy", "note": "Not malicious; refer per acceptable-use policy."}
@@ -276,7 +354,7 @@
     "close-fp": {
       "type": "terminal",
       "title": "Close — false positive (benign resolutions)",
-      "instructions": "The bulk resolutions are explained by benign activity (ordinary browsing, adtech/CDN sprawl, or newly-registered legitimate domains) with no malicious follow-through and no credential exposure.\n\n- Document the benign explanation and the attributing evidence (process/browser, clean enrichment, no beaconing).\n- Propose scoped tuning: raise thresholds or allow-list chronically noisy legitimate domains/categories so routine browsing does not re-alert.\n- Note any category that is systematically over-firing (e.g. Newly Seen Domains) for detection engineering.",
+      "instructions": "The bulk resolutions are explained by benign activity (ordinary browsing, adtech/CDN sprawl, newly-registered legitimate domains, or browser-only crypto activity) with no malicious follow-through and no credential exposure.\n\n- Document the benign explanation and the attributing evidence (process/browser, clean enrichment, no beaconing/recurrence).\n- Propose scoped tuning: raise thresholds or allow-list chronically noisy legitimate domains/categories so routine browsing does not re-alert.\n- Note any category that is systematically over-firing (e.g. Newly Seen Domains) for detection engineering.",
       "disposition": "closed",
       "playbook": "TUNE-AND-CLOSE",
       "summary": "Bulk risky-category DNS resolutions explained by benign browsing/adtech/newly-registered domains; no malicious follow-through. Closed as false positive with tuning proposed."
@@ -285,19 +363,37 @@
     "close-policy": {
       "type": "terminal",
       "title": "Close — benign but policy-relevant",
-      "instructions": "Activity is not a security threat but violates acceptable-use (e.g. prohibited categories/services). No malware, C2, or credential exposure.\n\n- Document the non-malicious nature and the specific policy concern.\n- Refer to the appropriate owner (management/HR) per acceptable-use policy rather than treating as a security incident.\n- Propose tuning so genuinely benign traffic of this shape does not generate security alerts.",
+      "instructions": "Activity is not a security threat but violates acceptable-use (e.g. prohibited categories/services, or user-installed cryptomining software on a corporate asset). No malware, C2, or credential exposure.\n\n- Document the non-malicious nature and the specific policy concern.\n- For user-installed mining software: confirm removal of the software from the corporate asset and document the user's acknowledgment.\n- Refer to the appropriate owner (management/HR) per acceptable-use policy rather than treating as a security incident.\n- Propose tuning so genuinely benign traffic of this shape does not generate security alerts.",
       "disposition": "other",
       "playbook": "TUNE-AND-CLOSE",
-      "summary": "Resolutions non-malicious but policy-relevant; referred per acceptable-use policy and tuning proposed."
+      "summary": "Resolutions non-malicious but policy-relevant (acceptable-use, incl. intentional user cryptomining); referred per policy, software removed where applicable, tuning proposed."
     },
 
     "phishing-exposure-close": {
       "type": "terminal",
       "title": "Close — phishing exposure, no compromise",
-      "instructions": "The user reached a phishing domain but did not submit credentials and no account misuse is evident.\n\n- Document that the link was clicked but no credentials were entered and identity logs show no misuse.\n- Block the phishing domains at the DNS/network layer and confirm the delivering email is remediated for all recipients.\n- Provide user awareness follow-up and confirm no other recipients engaged.\n- Propose blocking/tuning so the campaign's infrastructure is denied going forward.",
+      "instructions": "The user reached a phishing domain but did not submit credentials (on any device) and no account misuse is evident.\n\n- Document that the link was clicked but no credentials were entered — including confirmation covering the user's phone/personal devices — and that identity logs show no misuse.\n- Block the phishing domains AND any secondary domains found in the surrounding-activity review at the DNS/network layer, and confirm the delivering email is remediated for all recipients.\n- Record any control-tuning outcome (email filtering gap, category block) identified from the domain's source.\n- Provide user awareness follow-up and confirm no other recipients engaged.",
       "disposition": "other",
       "playbook": "TUNE-AND-CLOSE",
-      "summary": "Phishing link clicked but no credentials exposed and no account misuse; domains blocked, email remediated, user educated."
+      "summary": "Phishing link clicked but no credentials exposed (corporate or personal device) and no account misuse; domains blocked, email remediated, controls tuned, user educated."
+    },
+
+    "close-blocked-no-impact": {
+      "type": "terminal",
+      "title": "Close — blocked with surrounding activity verified clean",
+      "instructions": "The flagged domains (phishing or newly-seen) were blocked AND the surrounding-activity review confirmed no follow-through: no suspicious secondary domains were allowed, no unexplained files were downloaded, the domain's source was identified, and the user (where applicable) confirmed no credential entry or unprotected mobile click. This is the only acceptable path to closing a 'it was blocked' ticket — the block alone is never the justification.\n\n- Document all four review outcomes (secondary domains, source, download timeline, user follow-up) in the evidence above before closing.\n- Submit any control-tuning items identified: email filtering that delivered the link, malvertising/redirect categories worth blocking, or Umbrella policy adjustments.\n- Where the source was email, confirm the message was purged/remediated for all recipients so the campaign cannot generate repeat clicks.\n- Note reopen conditions: recurrence of the same or related domains from this host/user, or a later Falcon detection tied to the window.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Flagged phishing/newly-seen domains were blocked and the surrounding-activity review (secondary domains, source, downloads, user/mobile follow-up) came back clean; controls tuned and closed with reopen conditions."
+    },
+
+    "close-tech-handoff": {
+      "type": "terminal",
+      "title": "Close — one-off/browser-origin, handed to desktop tech",
+      "instructions": "The resolution was a confirmed one-off or originated from a web browser, with no recurrence in the wider window — lower concern from a threat perspective. The desktop tech owns tracking down and cleaning up the cause (adware, browser extension, malvertising exposure, junk software); we assist with identification to the extent our telemetry allows.\n\n- Deliver the handoff package to the tech: host, user, timestamps, domain(s), suspected origin (referrer/embedding page/installer), and an explicit statement of what could NOT be determined due to telemetry limits.\n- Confirm the flagged domains are blocked so any repeat attempt is denied and generates fresh telemetry.\n- Note reopen conditions clearly on the ticket: if the same host resolves these or related domains again — especially from a non-browser process or on a recurring cadence — this is no longer a one-off and returns to the malware investigation path.\n- If the tech's cleanup identifies an actual malicious binary, feed the hash back for a fleet-wide hunt rather than closing quietly.",
+      "disposition": "other",
+      "playbook": "TECH-HANDOFF",
+      "summary": "One-off or browser-originated resolution of risky domains with no recurrence; identification assisted where telemetry allowed, handed to desktop tech for cleanup, domains blocked, reopen conditions set."
     },
 
     "close-unresolved": {
