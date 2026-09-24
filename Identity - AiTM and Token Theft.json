@@ -1,0 +1,312 @@
+{
+  "id": "proc-aitm-session-token-theft",
+  "title": "AiTM / Session Token Theft",
+  "version": "1.0",
+  "detectionType": "Identity / Session hijack, anomalous token, or AiTM phishing (Entra ID Protection, Defender XDR, Okta)",
+  "severityDefault": "high",
+  "description": "An attacker may be using a stolen session cookie or refresh token for a user account — obtained through adversary-in-the-middle phishing, infostealer malware, or device code phishing. Stolen sessions carry the user's completed MFA, so the attacker is not challenged, and a password reset alone does not end them. This procedure analyzes sign-ins for capture and replay patterns, contains the identity in Entra and Okta, determines the theft vector, reviews and removes attacker persistence (MFA methods, devices, inbox rules, OAuth grants), and scopes the phishing campaign.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "Token theft means an attacker is using the user's already-authenticated SESSION (a session cookie or refresh token) rather than their password. Because MFA was completed by the real user, the attacker inherits an 'MFA-satisfied' session and never gets prompted. Resetting the password alone does NOT end a stolen session.\n\nThe three common ways tokens are stolen (you will determine which later):\n1) Adversary-in-the-Middle (AiTM) phishing: a reverse-proxy phishing kit (e.g. Evilginx, Tycoon 2FA, EvilProxy, Mamba 2FA, Sneaky 2FA) sits between the user and the real Microsoft or Okta login page. The user sees real branding and completes real MFA; the proxy captures the password AND the resulting session cookie.\n2) Infostealer malware on a device the user signs in from: browser cookies and tokens are copied off the machine (see the ClickFix and generic malware playbooks).\n3) Device code phishing: the user is tricked into entering a code at the Microsoft device login page (often a fake 'Teams meeting' or 'document' invite), which issues tokens directly to the attacker.\n\nConfirm this is a new case and record:\n- Alert source and name. Examples: Entra ID Protection risk detections such as 'Anomalous token', 'Attacker in the Middle', 'Unfamiliar sign-in properties', 'Malicious IP address', 'Anonymous IP address'; Defender XDR alerts about a possible AiTM phishing attempt or a stolen session cookie being used; Okta Identity Threat Protection session-hijack / entity risk signals or ThreatInsight; Avanan phishing alert; user report.\n- User: UPN, role, department, privilege level (admins, finance, executives, and anyone who approves payments raise severity immediately).\n- Suspicious sign-in(s): time, IP, location, application, device/browser.\n- Whether Microsoft's automatic attack disruption, Okta, or another control has ALREADY disabled the user or revoked sessions — note what was done automatically so you do not assume it was not.\n\nSPEED MATTERS: attackers typically act within minutes of replaying a session — mailbox rules, MFA registration, and internal phishing. If the alert shows a successful sign-in from unfamiliar infrastructure in the last few hours, skim the next step quickly and move to containment; you can come back for detail.",
+      "evidence": [
+        {
+          "id": "source",
+          "label": "Alert source / detection name / automatic actions already taken",
+          "type": "textarea"
+        },
+        {
+          "id": "user",
+          "label": "User (UPN / role / privilege)",
+          "type": "textarea"
+        },
+        {
+          "id": "signin",
+          "label": "Suspicious sign-in(s): time / IP / location / app / device",
+          "type": "textarea"
+        }
+      ],
+      "next": "signin-analysis"
+    },
+    "signin-analysis": {
+      "type": "step",
+      "title": "Analyze the sign-ins for token theft and replay",
+      "instructions": "Build the user's sign-in timeline for the last 7-14 days and find the pattern that separates token replay from normal travel or VPN noise.\n\nTHE AiTM FINGERPRINT — two phases with different IPs:\n- PHASE 1, capture: an INTERACTIVE sign-in with a correct password and SUCCESSFUL MFA — but from the phishing proxy server's IP (usually a hosting/cloud provider), not the user's own IP. The user agent often looks exactly like the user's real browser because the proxy passes it through. This is the moment the user was phished.\n- PHASE 2, replay: sign-ins with the SAME session, from a DIFFERENT IP (often a VPN, a residential proxy near the user's city, or another hosting provider), where MFA shows as 'satisfied by claim in the token' (no new MFA prompt), frequently from a different browser/OS and an unmanaged or unknown device.\n- The strongest single indicator: one Session ID used from multiple unrelated IPs/ASNs/devices within a short time.\n\nINFOSTEALER FINGERPRINT: replayed sessions/refresh tokens from new infrastructure with NO preceding phishing sign-in (no phase 1), often days after a malware event on one of the user's devices.\n\nDEVICE CODE FINGERPRINT: a sign-in whose Authentication protocol is 'Device code', from an IP that is not the user's, typically to Microsoft Office / Graph / Teams apps — followed by token use from attacker infrastructure.\n\nHOW TO LOOK — Entra admin center (Monitoring & health > Sign-in logs):\n- Filter User = the user; review BOTH 'User sign-ins (interactive)' and 'User sign-ins (non-interactive)' — replayed refresh tokens show up mostly as non-interactive.\n- For each suspicious sign-in open: Basic info (Session ID, Correlation ID, Application), Location (IP), Device info (browser, OS, device ID, compliant/managed), Authentication details (was MFA performed or 'satisfied by claim in the token'), Conditional Access (which policies applied, success/failure), and Authentication protocol.\n- Identity Protection > Risky users / Risk detections for this user: detection types and timestamps.\n\nHOW TO LOOK — Defender Advanced hunting:\n    AADSignInEventsBeta\n    | where AccountUpn =~ \"<user@domain>\" and Timestamp > ago(14d)\n    | project Timestamp, LogonType, Application, ErrorCode, IPAddress, Country, City, UserAgent, DeviceName, IsManaged, IsCompliant, AuthenticationRequirement, SessionId, RiskLevelDuringSignIn, RiskEventTypes\n    | order by Timestamp asc\n  Find sessions used from more than one IP:\n    AADSignInEventsBeta\n    | where AccountUpn =~ \"<user@domain>\" and Timestamp > ago(14d) and ErrorCode == 0 and isnotempty(SessionId)\n    | summarize IPs=make_set(IPAddress), Countries=make_set(Country), Agents=make_set(UserAgent), First=min(Timestamp), Last=max(Timestamp) by SessionId\n    | where array_length(IPs) > 1\n  (If your schema lacks SessionId, compare Session ID in the portal's sign-in details instead.)\n\nHOW TO LOOK — Okta (Reports > System Log):\n- Query: actor.alternateId eq \"<user@domain>\" for the same window. Key events: user.session.start, user.authentication.auth_via_mfa, policy.evaluate_sign_on, user.authentication.sso (app access), user.mfa.factor.activate, user.session.end.\n- Group by authenticationContext.externalSessionId (Okta's session ID). The SAME externalSessionId appearing from different client.ipAddress values / different client.userAgent values = session hijack.\n- Check securityContext (asOrg, asNumber, isProxy) for hosting providers and anonymizers, and debugContext.debugData for behaviors (New Geo-Location, New Device, New IP, Velocity) and risk.\n- If Identity Threat Protection is licensed, review the user's risk events and any session-hijack detections.\n\nENRICH EVERY SUSPICIOUS IP:\n- ASN / owner (ipinfo.io or the ASN shown in Okta/Entra): consumer ISP vs. hosting/VPS provider vs. VPN.\n- Spur (spur.us) for whether it is a residential proxy, VPN exit, or anonymizer — attackers often replay through residential proxies geolocated near the victim to avoid 'impossible travel'.\n- AbuseIPDB and VirusTotal for prior reports; Shodan for what the host is running (a phishing proxy server may show web services on unusual ports and TLS certificates for look-alike domains).\n\nBENIGN LOOK-ALIKES TO RULE OUT: corporate VPN or secure web gateway egress, the user traveling, iCloud Private Relay, a mobile phone switching between Wi-Fi and cellular (IP changes but same device and user agent), a newly issued laptop. Benign explanations keep the SAME device and browser; replay usually changes them.\n\nDetermine whether any replay attempt SUCCEEDED (ErrorCode 0 / Okta outcome SUCCESS) or was blocked by Conditional Access / Okta policy.",
+      "evidence": [
+        {
+          "id": "timeline",
+          "label": "Sign-in timeline (capture sign-in, replay sign-ins, apps accessed)",
+          "type": "textarea"
+        },
+        {
+          "id": "session",
+          "label": "Session ID(s) used from multiple IPs/devices",
+          "type": "textarea"
+        },
+        {
+          "id": "ips",
+          "label": "Suspicious IPs with ASN / proxy / reputation enrichment",
+          "type": "textarea"
+        },
+        {
+          "id": "mfa",
+          "label": "MFA detail (performed vs. satisfied by token), device & CA results",
+          "type": "textarea"
+        },
+        {
+          "id": "success",
+          "label": "Replay succeeded or blocked?",
+          "type": "text"
+        }
+      ],
+      "next": "theft-verdict?"
+    },
+    "theft-verdict?": {
+      "type": "decision",
+      "title": "Is this token theft?",
+      "instructions": "- Confirmed or likely: session reuse across unrelated IPs/devices, MFA-satisfied sign-ins from hosting/proxy infrastructure, an 'Anomalous token' / 'Attacker in the Middle' detection that the evidence supports, device-code sign-in from a foreign IP, or user confirms a phishing click.\n- Benign: a verified explanation (VPN, travel, new device) where device, browser, and behavior stay consistent — confirm with the user through a trusted channel, not by replying to anything the attacker could see.\n- If you cannot explain it, treat it as token theft. Containment is disruptive for an hour; a missed session hijack can be a payroll or wire fraud.",
+      "options": [
+        {
+          "label": "Token theft confirmed or likely (replay succeeded or unknown)",
+          "next": "contain-identity",
+          "note": "Contain immediately."
+        },
+        {
+          "label": "Credentials/session captured, but every replay was blocked",
+          "next": "contain-identity",
+          "note": "Still contain — the attacker has the password."
+        },
+        {
+          "label": "Benign — verified VPN / travel / device change",
+          "next": "benign-close",
+          "note": "False positive; document and tune."
+        }
+      ]
+    },
+    "contain-identity": {
+      "type": "step",
+      "title": "Contain the identity",
+      "instructions": "Goal: invalidate every session and token, remove the attacker's ability to sign back in, and do it in the right order. If the attacker is actively working in the account, block sign-in first, then clean up, then re-enable.\n\n1) If activity is ongoing, BLOCK SIGN-IN temporarily: Entra > Users > <user> > Edit properties > Settings > uncheck 'Account enabled' (Okta: Suspend the user). Coordinate with the user out-of-band.\n\n2) RESET THE PASSWORD (AiTM captured it; infostealers may have too), from a clean device, communicated out-of-band. If the user is synced from on-prem AD, reset in AD so it syncs.\n\n3) REVOKE ALL SESSIONS AND REFRESH TOKENS:\n   Entra: Users > <user> > Revoke sessions   |   PowerShell: Revoke-MgUserSignInSession -UserId <UPN>\n   Okta: People > <user> > More Actions > Clear User Sessions (include revoking OAuth/refresh tokens). If Okta Universal Logout is configured, use it to sign the user out of connected apps as well.\n   Note: apps that support Continuous Access Evaluation (Exchange Online, SharePoint, Teams) react within minutes; others can honor an existing access token until it expires (about an hour). Keep watching sign-ins during that window.\n\n4) REMOVE ATTACKER PERSISTENCE YOU CAN SEE IMMEDIATELY (a full review follows):\n   - MFA methods: Entra > Users > <user> > Authentication methods — delete any method the user did not register (new authenticator app, phone number, FIDO key). Okta: user > Reset/remove factors not enrolled by the user.\n   - Devices: Entra > Users > <user> > Devices — delete/disable devices registered or joined during the compromise window (attackers register a device to obtain long-lived tokens).\n\n5) MARK AND BLOCK:\n   - Identity Protection > Risky users > the user > 'Confirm user compromised' (feeds risk-based policies and Microsoft's models).\n   - Add attacker IPs to a blocked named location in Entra Conditional Access; add them to a blocked network zone in Okta.\n   - Block the IPs on Meraki (Layer 3 deny) and add the phishing domains to an Umbrella block destination list.\n\n6) Re-enable the account once cleanup is complete and the user has a fresh password and verified MFA.\n\nRecord every action with a timestamp.",
+      "evidence": [
+        {
+          "id": "blocked",
+          "label": "Sign-in blocked/suspended? (time, re-enabled time)",
+          "type": "text"
+        },
+        {
+          "id": "reset",
+          "label": "Password reset & session revocation (Entra / Okta, times)",
+          "type": "textarea"
+        },
+        {
+          "id": "mfa",
+          "label": "Attacker MFA methods / devices removed",
+          "type": "textarea"
+        },
+        {
+          "id": "blocks",
+          "label": "Confirm-compromised, CA / Okta zone / Meraki / Umbrella blocks",
+          "type": "textarea"
+        }
+      ],
+      "next": "vector",
+      "playbook": "CONTAINMENT"
+    },
+    "vector": {
+      "type": "step",
+      "title": "Determine how the token was stolen",
+      "instructions": "Knowing the vector tells you what else needs cleaning (a phishing campaign vs. an infected device) and who else is at risk.\n\nAiTM PHISHING — look for the lure and the phishing site:\n- Avanan: search the user's mail for the 24-48 hours before the capture sign-in. Typical lures: shared-document / e-signature / voicemail / invoice notifications, often with a link through a redirector (legitimate URL shortener, marketing tracker, or compromised site) or a CAPTCHA/Cloudflare Turnstile gate to evade scanners; PDF or HTML attachments; QR codes ('quishing'). Note sender, URL, and all other recipients.\n- Umbrella (Activity Search, user's identity, 30 minutes before the capture sign-in): the phishing domain is often newly registered or newly seen, sometimes resembling a login or document service. Enrich in VirusTotal and urlscan.io — search urlscan for the domain; AiTM pages usually show a Microsoft or Okta login screenshot on a non-Microsoft domain.\n- QR code caveat: if the user scanned a QR code with their PHONE, the phishing visit happened off the corporate network and Umbrella will not see it (unless the phone runs the roaming client). The capture sign-in will then show a mobile browser user agent.\n- The capture sign-in's IP (phase 1) is the phishing proxy server — enrich with Shodan and VirusTotal; other domains on that IP may be part of the same kit.\n\nINFOSTEALER — look at the user's devices:\n- CrowdStrike / Defender: any detections on devices the user signs in from in the last 30 days (including personal devices if they use them for corporate sign-in — which you may not have telemetry for; ask the user).\n- Signs: a non-browser process reading browser cookie/credential files, ClickFix-style executions, cracked-software downloads.\n    Defender: DeviceEvents | where Timestamp > ago(30d) and ActionType == \"SensitiveFileRead\" and InitiatingProcessAccountName =~ \"<username>\" (where available)\n    CrowdStrike: Endpoint detections filtered by the user's hosts; review any stealer/PUA/HackTool detections.\n- If an infected device is found, it must be contained and investigated under the malware/ClickFix playbook — otherwise the attacker will simply steal the new session.\n\nDEVICE CODE PHISHING — look for the device code sign-in:\n- Entra sign-in logs: filter Authentication protocol = Device code for the user. A device-code sign-in the user did not initiate from a TV/CLI tool is malicious.\n- Find the lure: Teams chats or emails with a 'meeting invite' or 'document' asking to enter a code at the Microsoft device login page (Avanan; Purview audit for Teams external chats).\n\nUSER INTERVIEW (trusted channel): any recent sign-in page that looked slightly off, a QR code scanned, a code entered on a Microsoft page, a document link that 'did not open', or software recently installed at home or at work.",
+      "evidence": [
+        {
+          "id": "lure",
+          "label": "Lure (email / QR / Teams / other) & sender",
+          "type": "textarea"
+        },
+        {
+          "id": "phishsite",
+          "label": "Phishing domain / proxy IP (with VirusTotal / urlscan / Shodan)",
+          "type": "textarea"
+        },
+        {
+          "id": "endpoint",
+          "label": "Endpoint/infostealer findings on user devices",
+          "type": "textarea"
+        },
+        {
+          "id": "devicecode",
+          "label": "Device-code sign-in evidence",
+          "type": "textarea"
+        },
+        {
+          "id": "vector",
+          "label": "Conclusion: AiTM / infostealer / device code / unknown",
+          "type": "text"
+        }
+      ],
+      "next": "vector?"
+    },
+    "vector?": {
+      "type": "decision",
+      "title": "What was the theft vector?",
+      "instructions": "An infected device must be handled before the account can be considered clean. Phishing vectors (AiTM or device code) require hunting the campaign. If unknown, continue with the activity review and note the gap — and make sure to check the user's devices anyway.",
+      "options": [
+        {
+          "label": "Infostealer / infected device",
+          "next": "device-handoff",
+          "note": "Contain the device, then continue."
+        },
+        {
+          "label": "AiTM or device-code phishing",
+          "next": "post-activity",
+          "note": "Review attacker actions; campaign hunt in scoping."
+        },
+        {
+          "label": "Unknown",
+          "next": "post-activity",
+          "note": "Continue; note the gap."
+        }
+      ]
+    },
+    "device-handoff": {
+      "type": "step",
+      "title": "Contain the infected device",
+      "instructions": "- Isolate the device (CrowdStrike 'Network contain' / Defender 'Isolate device') and open a linked case under the Generic Malware or ClickFix playbook for full investigation.\n- Until the device is reimaged, the user must NOT sign in from it — a stealer will capture the new password and session.\n- Every account whose credentials or cookies were stored in that browser is exposed: corporate SSO (Entra/Okta), and any other SaaS or personal accounts saved there. Revoke and rotate them, and advise the user on personal accounts.\n- If the device is personal/unmanaged, block its use for corporate access (Conditional Access / Okta device assurance) and advise the user to have it cleaned.",
+      "evidence": [
+        {
+          "id": "device",
+          "label": "Device isolated & linked malware case",
+          "type": "textarea"
+        },
+        {
+          "id": "accounts",
+          "label": "Other accounts/credentials exposed & rotated",
+          "type": "textarea"
+        }
+      ],
+      "next": "post-activity"
+    },
+    "post-activity": {
+      "type": "step",
+      "title": "Review everything the attacker did with the session",
+      "instructions": "Review activity from the first replay sign-in until containment. Attackers using stolen sessions move quickly toward persistence, mailbox access, internal phishing, and financial fraud.\n\nIDENTITY PERSISTENCE (Entra > Audit logs, filter Target = the user; Okta System Log):\n- 'User registered security info', 'User changed default security info', 'Update user' (phone/email changes), 'Register device', 'Add registered owner to device'.\n- 'Consent to application' / 'Add delegated permission grant' — an OAuth app granted during the session keeps access after all of the above is cleaned up. If found, run the Illicit OAuth App Consent playbook.\n- Okta: user.mfa.factor.activate, user.account.update_password, user.account.reset_password, app access via user.authentication.sso.\n\nMAILBOX (Purview > Audit, user + window; or Defender CloudAppEvents with the Microsoft 365 connector):\n- Inbox rules: New-InboxRule / Set-InboxRule / UpdateInboxRules — classic AiTM follow-up is a rule that moves or deletes mail containing words like 'invoice', 'payment', 'wire', 'bank', or the attacker's replies, often into RSS Feeds, Conversation History, or Archive, sometimes with names of one or two characters.\n  Also check directly: Exchange admin center or Get-InboxRule -Mailbox <user> | Format-List Name, Enabled, Conditions, MoveToFolder, DeleteMessage, ForwardTo, RedirectTo\n- Forwarding: Set-Mailbox forwarding / ForwardingSmtpAddress; transport-level forwarding.\n- Mail read: MailItemsAccessed from the attacker IPs/sessions (availability depends on audit licensing).\n- Mail sent: Send / SendAs — internal phishing to the user's contacts (the same AiTM lure re-sent from a trusted account is the normal next step), or replies into existing finance/vendor threads (BEC).\n\nFILES: SharePoint/OneDrive FileAccessed / FileDownloaded / sharing link creation from attacker IPs.\n\nTEAMS: messages sent to internal users or external tenants during the window.\n\nOTHER APPS VIA SSO: Okta user.authentication.sso events and Entra sign-ins to other applications (HR/payroll, finance, CRM, cloud consoles) from attacker IPs — each may need its own review (e.g. payroll direct-deposit changes).\n\nUSEFUL HUNT — all activity from the attacker IPs (Defender):\n    CloudAppEvents\n    | where Timestamp > datetime(<first replay>) and IPAddress in (\"<ip1>\",\"<ip2>\")\n    | summarize count(), make_set(ActionType) by AccountDisplayName, Application\n\nFINANCIAL: if the user handles payments or vendor relationships, search their mailbox for threads with vendors/customers in the window, and notify finance to hold any payment-detail changes pending verification by phone.",
+      "evidence": [
+        {
+          "id": "persistence",
+          "label": "Identity persistence (MFA / devices / OAuth consents / password changes)",
+          "type": "textarea"
+        },
+        {
+          "id": "mailbox",
+          "label": "Inbox rules / forwarding / mail read / mail sent",
+          "type": "textarea"
+        },
+        {
+          "id": "files",
+          "label": "Files / Teams / other SSO apps accessed",
+          "type": "textarea"
+        },
+        {
+          "id": "fraud",
+          "label": "BEC / financial exposure & finance notification",
+          "type": "textarea"
+        }
+      ],
+      "next": "eradicate"
+    },
+    "eradicate": {
+      "type": "step",
+      "title": "Remove all attacker persistence",
+      "instructions": "Clean up everything found in the activity review. Anything missed lets the attacker back in without the password.\n\n- Delete malicious inbox rules and forwarding (Remove-InboxRule; Set-Mailbox -ForwardingSmtpAddress $null -DeliverToMailboxAndForward $false). Recover mail the rules moved or deleted so the user sees any attacker replies.\n- Confirm all attacker MFA methods and devices are removed (re-check — attackers sometimes add a second method just before containment).\n- Remove OAuth app grants made during the session (and disable the app — see the Illicit OAuth App Consent playbook).\n- Revoke sharing links the attacker created in OneDrive/SharePoint.\n- Revoke sessions ONE MORE TIME after cleanup (Entra and Okta), so no token issued during cleanup survives.\n- Have the user re-register MFA with verified identity if any method was in doubt; ideally move them to a phishing-resistant method now (FIDO2 key, Windows Hello for Business, Okta FastPass), which defeats AiTM proxies.\n- Monitor the user's sign-ins for 48-72 hours for any return from new infrastructure.",
+      "evidence": [
+        {
+          "id": "removed",
+          "label": "Rules / forwarding / grants / links removed (and mail recovered)",
+          "type": "textarea"
+        },
+        {
+          "id": "final",
+          "label": "Final session revocation & MFA re-registration (times)",
+          "type": "textarea"
+        },
+        {
+          "id": "monitor",
+          "label": "Monitoring plan (who / until when)",
+          "type": "text"
+        }
+      ],
+      "next": "scope"
+    },
+    "scope": {
+      "type": "step",
+      "title": "Scope the campaign",
+      "instructions": "AiTM campaigns target many users, and a compromised mailbox is used to phish more.\n\n- Lure recipients: Avanan search for the same sender, subject, URL, or attachment across all mailboxes; quarantine/purge them.\n- Clickers: Umbrella Activity Search for the phishing domain(s) across all identities for the last 14-30 days.\n- Other victims by infrastructure: sign-ins from the phishing proxy IPs and replay IPs across ALL users:\n    AADSignInEventsBeta\n    | where Timestamp > ago(30d) and IPAddress in (\"<ip1>\",\"<ip2>\")\n    | summarize count(), make_set(ErrorCode) by AccountUpn\n  Okta: System Log query client.ipAddress eq \"<ip>\" for each IP.\n- Other victims by pattern: recent Identity Protection 'Anomalous token' / 'Attacker in the Middle' detections across the tenant, and Okta session-hijack signals.\n- Internal phishing sent from this user: every recipient is a potential next victim — check whether any of them signed in from suspicious infrastructure afterwards.\n- Each additional compromised user needs its own containment (return to the containment step for them).\n- Build the timeline: lure delivery -> click -> capture sign-in -> replay -> attacker actions -> containment -> eradication.",
+      "evidence": [
+        {
+          "id": "recipients",
+          "label": "Lure recipients & clickers",
+          "type": "textarea"
+        },
+        {
+          "id": "victims",
+          "label": "Other compromised users found",
+          "type": "textarea"
+        },
+        {
+          "id": "internal",
+          "label": "Internal phishing sent & follow-up",
+          "type": "textarea"
+        },
+        {
+          "id": "timeline",
+          "label": "Timeline: lure -> capture -> replay -> actions -> containment",
+          "type": "textarea"
+        }
+      ],
+      "next": "impact?",
+      "playbook": "SCOPING"
+    },
+    "impact?": {
+      "type": "decision",
+      "title": "What was the impact?",
+      "instructions": "Any successful replay that led to attacker actions (mail read/sent, rules, persistence, file access, financial activity), multiple compromised users, a privileged account, or an infected device = escalate. A capture where every replay was blocked, with no attacker actions and a single user, can be closed as contained.",
+      "options": [
+        {
+          "label": "Attacker actions taken / multiple users / privileged / infected device",
+          "next": "escalate",
+          "note": "Escalate to IR."
+        },
+        {
+          "label": "Replay blocked or no attacker actions — single user, fully remediated",
+          "next": "close-contained",
+          "note": "Close with hardening notes."
+        }
+      ]
+    },
+    "escalate": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "Token theft led to account use by the attacker, or the incident involves multiple users, a privileged account, or an infected device.\n\n- Ensure the sign-in analysis, vector, containment, attacker activity, eradication, and scope are all recorded above.\n- Assign severity per your matrix — raise for BEC/financial activity, privileged accounts, data access, or internal phishing spread.\n- Notify the on-call IR owner; involve finance (payment holds/recall), legal/privacy (mailbox or file data accessed), and communications if external parties were phished from your domain.\n- Hardening for post-incident review: phishing-resistant MFA (FIDO2, Windows Hello for Business, Okta FastPass) for at least privileged and finance users; Conditional Access requiring compliant or hybrid-joined devices; token protection where supported; blocking device code flow via Conditional Access (Authentication flows condition) for users who do not need it; Okta device assurance policies; Umbrella blocking of newly seen domains.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Session token theft confirmed with attacker activity; identity contained, persistence removed, campaign scoped, escalated to IR."
+    },
+    "close-contained": {
+      "type": "terminal",
+      "title": "Close — token theft contained, no attacker activity",
+      "instructions": "Credentials/session were captured but every replay was blocked or no attacker action occurred, for a single user, and remediation is complete.\n\n- Document the capture evidence, why replay failed (which Conditional Access / Okta policy blocked it — that control worked and is worth noting), containment and eradication actions.\n- Confirm blocks on phishing domains and attacker IPs, and lure purge from mailboxes.\n- Confirm the monitoring window completed without recurrence.\n- Brief the user on the lure; recommend phishing-resistant MFA enrollment.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Token/credential capture contained before attacker activity; user remediated, infrastructure blocked, closed."
+    },
+    "benign-close": {
+      "type": "terminal",
+      "title": "Close — benign sign-in anomaly (false positive)",
+      "instructions": "- Document the verified explanation (VPN/secure gateway egress, travel, new device, carrier IP change) and how it was verified with the user through a trusted channel.\n- Note the consistent evidence: same device ID and browser, managed/compliant device, no new MFA methods or mailbox changes.\n- If a VPN or gateway egress recurs, propose adding it as a trusted named location / Okta network zone rather than suppressing the detection type.\n- In Identity Protection, 'Confirm user safe' (or dismiss the risk) so the user is not repeatedly challenged.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Sign-in anomaly verified as benign (VPN/travel/device change); documented, risk dismissed, tuning proposed."
+    }
+  }
+}
