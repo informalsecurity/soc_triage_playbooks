@@ -1,0 +1,354 @@
+{
+  "id": "proc-illicit-oauth-app-consent",
+  "title": "Illicit OAuth App Consent",
+  "version": "1.0",
+  "detectionType": "Identity / OAuth app consent or app credential change (Entra ID, Defender for Cloud Apps, Okta)",
+  "severityDefault": "high",
+  "description": "A user or administrator granted permissions to an OAuth application, or an application in the tenant gained new credentials, and the app may be attacker-controlled. Consent phishing gives an attacker persistent API access to mail, files, and directory data that survives password resets and MFA. This procedure profiles the app (owner, publisher, reply URLs), evaluates its permissions, establishes how consent was obtained, and then contains and scopes a malicious app or routes legitimate apps to a policy or tuning close.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "Illicit consent grant ('consent phishing') is when an attacker gets a user — or worse, an admin — to click 'Accept' on a Microsoft permission prompt for an attacker-controlled app. The app then holds OAuth tokens that read mail, send mail, or access files AS the user, through Microsoft Graph, without needing the password. Because no password is stolen, resetting the password does NOT remove the app's access. MFA does not help either — the user completed MFA themselves before consenting. The app keeps working until its permission grant is removed.\n\nThis playbook also covers the related persistence pattern: an attacker who already controls an account registers a NEW app in your tenant, or adds a secret/certificate to an existing one, so they keep access after the account is cleaned up.\n\nConfirm this is a new case (check for other consents to the same app — these are usually campaigns) and record:\n- Alert source: Defender for Cloud Apps / App governance alert, Entra audit log alert, Identity Protection, Avanan (consent-phishing email), user report, or proactive hunt.\n- The app: display name AND the Application (client) ID — a GUID. Names can be faked or duplicated; the App ID is the real identifier. Also note the service principal Object ID in your tenant.\n- Who consented: user UPN(s), role, whether they are an administrator.\n- Consent type: user consent (delegated permissions for that one user) vs. admin consent (tenant-wide — every user's data, or app-only permissions). Admin consent is far more severe.\n- Time of consent, and the IP / location the consent came from.\n\nWHERE TO FIND IT — Entra admin center:\n- Identity > Monitoring & health > Audit logs: Category = ApplicationManagement (or UserManagement), Activity = 'Consent to application'. Open the entry — Modified Properties show ConsentContext.IsAdminConsent, the permissions granted, and the target app. Related entries within seconds: 'Add delegated permission grant', 'Add app role assignment to service principal', 'Add service principal'.\n- Identity > Applications > Enterprise applications > search the App ID.",
+      "evidence": [
+        {
+          "id": "source",
+          "label": "Alert source & detection name",
+          "type": "text"
+        },
+        {
+          "id": "app",
+          "label": "App display name / Application (client) ID / SP Object ID",
+          "type": "textarea"
+        },
+        {
+          "id": "consenter",
+          "label": "Who consented (UPN / role / admin?)",
+          "type": "textarea"
+        },
+        {
+          "id": "type",
+          "label": "Consent type (user / admin) & time / source IP",
+          "type": "text"
+        }
+      ],
+      "next": "app-profile"
+    },
+    "app-profile": {
+      "type": "step",
+      "title": "Profile the app — who owns it and where does it send data?",
+      "instructions": "The single most important question: whose app is this, and is it what it claims to be? Collect the facts below, then score them against the red and green flags.\n\nHOW TO LOOK — Entra portal (Enterprise applications > the app):\n- Properties: Homepage URL, Publisher, Application ID, Object ID, whether 'Enabled for users to sign in', and whether it is visible to users.\n- Overview / Single sign-on: publisher verification badge (a blue 'verified' check means the publisher proved identity through Microsoft's partner program).\n- Owners, Users and groups, Permissions (two tabs: Admin consent and User consent), Sign-in logs, Audit logs.\n\nHOW TO LOOK — Microsoft Graph PowerShell (read-only scopes are enough: Application.Read.All, Directory.Read.All):\n    $sp = Get-MgServicePrincipal -Filter \"appId eq '<APP-ID>'\"\n    $sp | Format-List DisplayName, AppId, Id, AppOwnerOrganizationId, PublisherName, VerifiedPublisher, SignInAudience, ReplyUrls, Homepage, AccountEnabled, Tags\n- AppOwnerOrganizationId = the tenant that OWNS the app.\n  - Your own tenant ID: the app was registered inside your tenant — go straight to 'who created it' below.\n  - f8cdef31-a31e-4b4a-93e4-5f571e91255a: Microsoft first-party.\n  - Any other value: a third-party (external) multi-tenant app.\n\nIF THE APP IS OWNED BY YOUR TENANT (possible attacker persistence):\n- Entra > App registrations > the app: Owners, Certificates & secrets (look for recently added secrets or certificates), API permissions, creation date.\n- Audit logs: 'Add application', 'Add owner to application', 'Update application – Certificates and secrets management', 'Add service principal credentials'. Who performed them, from what IP, and was that account itself compromised?\n\nRED FLAGS (each raises suspicion; several together = likely malicious):\n- Unverified publisher, from an external tenant, with very few users in your tenant (often only the victim).\n- Name that imitates Microsoft or a trusted brand ('Microsoft Office Update', 'Outlook Security', 'OneDrive Sync', 'DocuSign', 'Adobe'), but the owner tenant is NOT Microsoft's. Also look-alike characters and generic names ('App', 'Test', 'Mail', 'Secure Document').\n- Reply URLs (redirect URIs — where tokens and codes are sent) that are: localhost or 127.0.0.1 on a multi-tenant app, bare IP addresses, plain http://, tunneling services (ngrok and similar), free hosting / serverless subdomains (e.g. herokuapp.com, azurewebsites.net, workers.dev, glitch.me, netlify.app with a random-looking name), URL shorteners, or newly registered domains.\n- Reply URL / homepage domain does not match the claimed publisher.\n- Missing or empty homepage, privacy statement, and terms of service.\n- App created very recently.\n- Secrets or certificates added to an in-tenant app by an account that has no business owning apps.\n\nGREEN FLAGS (lower suspicion — but do not rely on any single one):\n- Verified publisher that matches a known vendor, and reply URLs on that vendor's own domain.\n- Many users in your tenant have used it for a long time; it appears on your approved-software list.\n- Consent came through your admin consent workflow or a documented rollout.\n\nEXTERNAL ENRICHMENT:\n- VirusTotal and urlscan.io (search first; use private scans) on every reply URL and homepage domain: detections, WHOIS age, hosting, prior scans.\n- Shodan (shodan.io/host/<IP>) on the IPs behind the reply URLs: hosting provider, other services on the box.\n- WHOIS / registration date of reply URL domains (via VirusTotal's details tab or a registrar lookup).\n- Web search for the App ID GUID and the app name — known malicious consent apps are often named in vendor threat reports.\n- Vendor's own documentation: legitimate SaaS vendors usually publish their Entra App ID and required permissions.",
+      "evidence": [
+        {
+          "id": "owner",
+          "label": "Owner tenant (AppOwnerOrganizationId) — ours / Microsoft / external",
+          "type": "text"
+        },
+        {
+          "id": "publisher",
+          "label": "Publisher name & verification status",
+          "type": "text"
+        },
+        {
+          "id": "urls",
+          "label": "Reply URLs & homepage (with enrichment results)",
+          "type": "textarea"
+        },
+        {
+          "id": "created",
+          "label": "App creation date / in-tenant creator & credential changes",
+          "type": "textarea"
+        },
+        {
+          "id": "flags",
+          "label": "Red and green flags observed",
+          "type": "textarea"
+        }
+      ],
+      "next": "permissions-review"
+    },
+    "permissions-review": {
+      "type": "step",
+      "title": "Review what the app can do (permissions)",
+      "instructions": "Permissions determine the blast radius. Two kinds matter:\n- DELEGATED permissions (from user consent): the app acts AS the user who consented, limited to that user's data.\n- APPLICATION permissions (require admin consent): the app acts AS ITSELF with no user present, typically across the ENTIRE tenant (every mailbox, every file). Treat any unexpected application permission as critical.\n\nHOW TO LOOK:\n- Portal: Enterprise applications > the app > Permissions (Admin consent and User consent tabs).\n- PowerShell:\n    # Delegated grants: ConsentType 'Principal' = one user (PrincipalId), 'AllPrincipals' = admin consented for everyone\n    Get-MgOauth2PermissionGrant -Filter \"clientId eq '$($sp.Id)'\" | Format-List Id, ConsentType, PrincipalId, ResourceId, Scope\n    # Application permissions granted to the app\n    Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id | Format-List AppRoleId, ResourceDisplayName, CreatedDateTime\n  (Map AppRoleId GUIDs to names via the resource's AppRoles, e.g. the Microsoft Graph service principal.)\n\nHIGH-RISK PERMISSIONS (what consent-phishing apps typically ask for):\n- Mail: Mail.Read, Mail.ReadWrite, Mail.Send, MailboxSettings.ReadWrite (can create inbox rules), EWS.AccessAsUser.All, IMAP.AccessAsUser.All, full_access_as_app (application, all mailboxes).\n- Files: Files.Read.All, Files.ReadWrite.All, Sites.Read.All, Sites.ReadWrite.All.\n- People/org data: Contacts.Read, People.Read, User.Read.All, Directory.Read.All (useful for building the next phishing wave).\n- Chat: Chat.Read, ChannelMessage.Read.All.\n- offline_access: grants a refresh token, so the app keeps access for weeks or months without the user. Combined with Mail.Read / Files.Read.All, this is the classic consent-phishing set.\n- Privilege-escalation (application): RoleManagement.ReadWrite.Directory, AppRoleAssignment.ReadWrite.All, Application.ReadWrite.All, Directory.ReadWrite.All — these let the app grant itself or others more power. Critical.\n\nLOW-RISK (typical for 'Sign in with Microsoft' only): openid, profile, email, User.Read. An app with ONLY these is usually just a login integration.\n\nINTERPRETATION:\n- Does the permission set match what the app claims to do? A 'PDF viewer' asking for Mail.ReadWrite + Mail.Send + offline_access is a mismatch.\n- Legitimate apps can be over-permissioned too (e.g. AI note-takers, scheduling tools, email add-ons reading all mail). Over-permissioned does not equal malicious — but it does mean data exposure worth a policy decision.\n\nIF LICENSED — Defender for Cloud Apps > App governance (or OAuth apps page): shows privilege level, permission usage, community prevalence, publisher status, and data-access volumes for the app. In Advanced hunting, the OAuthAppInfo table carries the same profile.",
+      "evidence": [
+        {
+          "id": "delegated",
+          "label": "Delegated permissions & consent type (Principal / AllPrincipals)",
+          "type": "textarea"
+        },
+        {
+          "id": "application",
+          "label": "Application permissions (app-only)",
+          "type": "textarea"
+        },
+        {
+          "id": "risk",
+          "label": "High-risk permissions present? Match to stated purpose?",
+          "type": "textarea"
+        }
+      ],
+      "next": "consent-context"
+    },
+    "consent-context": {
+      "type": "step",
+      "title": "Establish how the consent happened",
+      "instructions": "Find the lure and the circumstances of the click. This confirms (or rules out) consent phishing and reveals other victims.\n\nWHAT CONSENT PHISHING LOOKS LIKE:\n- The user gets an email/Teams message with a link to a REAL Microsoft sign-in URL (login.microsoftonline.com/.../oauth2/v2.0/authorize?client_id=<APP-ID>&redirect_uri=...&scope=...), often behind a redirect or a lure page ('view shared document', 'secure message', 'review invoice').\n- The user signs in normally (real Microsoft page, real MFA), then sees a 'Permissions requested' prompt listing the scopes, clicks Accept, and is redirected to the attacker's reply URL — often a fake document or error page.\n- Admin-targeted variants use an 'adminconsent' URL to request tenant-wide consent.\n\nHOW TO LOOK — Avanan:\n- Search the consenting user's mail in the hours/days before the consent for links containing 'oauth2', 'authorize', 'adminconsent', 'client_id=<APP-ID>', or the reply URL domain.\n- If found: sender, subject, full URL, and ALL other recipients of the same message/campaign.\n\nHOW TO LOOK — Umbrella (Reporting > Activity Search):\n- The browser is redirected to the reply URL right after consent. Search the reply URL / lure domains across ALL identities for the last 14-30 days — every identity that resolved them is a potential additional victim.\n- Also check the consenting user's resolutions a few minutes before consent to find the lure page.\n\nHOW TO LOOK — the sign-in that preceded the consent:\n- Entra sign-in logs for the user at the consent time: which application they signed in to (the malicious app's name/ID), IP, device, location, whether MFA was performed. Was it the user's normal device and IP?\n- Okta (if Microsoft 365 is federated to Okta): Reports > System Log, actor.alternateId eq \"<user@domain>\", around the consent time — the user.authentication.sso event into Office 365 shows the IP, user agent, and device context. If Okta also acts as an OAuth authorization server for your apps, search eventType eq \"app.oauth2.as.consent.grant\" for consents granted in Okta itself.\n- If the sign-in came from an unfamiliar IP/hosting provider, the ACCOUNT itself may be compromised (the attacker consented using a stolen session) — note this for the identity step.\n\nUSER INTERVIEW: what they clicked, what the permissions screen looked like, what page they landed on afterward. Ask for the email if not found.",
+      "evidence": [
+        {
+          "id": "lure",
+          "label": "Lure message / URL / sender (Avanan)",
+          "type": "textarea"
+        },
+        {
+          "id": "umbrella",
+          "label": "Umbrella: other identities resolving reply URL / lure domains",
+          "type": "textarea"
+        },
+        {
+          "id": "signin",
+          "label": "Sign-in context at consent (Entra / Okta: IP, device, MFA, normal?)",
+          "type": "textarea"
+        },
+        {
+          "id": "user",
+          "label": "User's account",
+          "type": "textarea"
+        }
+      ],
+      "next": "classify?"
+    },
+    "classify?": {
+      "type": "decision",
+      "title": "How do you classify the app?",
+      "instructions": "Weigh the app profile, permissions, and consent context together.\n- Malicious: unverified external app with red flags (brand impersonation, suspicious reply URLs, new domains) + high-risk scopes + consent via a lure. Or any in-tenant app / credential created by a suspicious or compromised account.\n- Legitimate but unsanctioned: a real, reputable vendor (verified publisher, vendor-owned reply URLs, public documentation), consented by a user without approval — often over-permissioned.\n- Sanctioned: approved business app, expected consent.\nWhen unsure between malicious and unsanctioned, treat as malicious — disabling a legitimate app for a day is cheap; leaving an attacker in a mailbox is not.",
+      "options": [
+        {
+          "label": "Malicious / suspicious external app (consent phishing)",
+          "next": "contain-app",
+          "note": "Cut off access immediately."
+        },
+        {
+          "label": "Attacker-created or modified app in our tenant (persistence)",
+          "next": "contain-app",
+          "note": "Also indicates a compromised account."
+        },
+        {
+          "label": "Legitimate vendor, but unsanctioned / over-permissioned",
+          "next": "shadow-it",
+          "note": "Policy decision, not intrusion."
+        },
+        {
+          "label": "Sanctioned business app, expected consent",
+          "next": "sanctioned-close",
+          "note": "Benign; document and tune."
+        }
+      ]
+    },
+    "contain-app": {
+      "type": "step",
+      "title": "Contain — cut off the app's access",
+      "instructions": "Remove the app's ability to get new tokens and kill the tokens it already has. Order matters.\n\n1) DISABLE the service principal (do this first — it blocks new token issuance for EVERY user):\n   Portal: Enterprise applications > the app > Properties > 'Enabled for users to sign in?' = No > Save.\n   PowerShell: Update-MgServicePrincipal -ServicePrincipalId $sp.Id -AccountEnabled:$false\n   Prefer DISABLE over DELETE: a deleted external app can simply be consented to again by the next phished user; a disabled one cannot be used or re-consented. Delete later only if you have also restricted user consent.\n\n2) REMOVE the permission grants (after documenting them in the previous step):\n   Get-MgOauth2PermissionGrant -Filter \"clientId eq '$($sp.Id)'\" | ForEach-Object { Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId $_.Id }\n   Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id | ForEach-Object { Remove-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -AppRoleAssignmentId $_.Id }\n   Also remove any user/group assignments (Users and groups tab).\n\n3) REVOKE the consenting users' refresh tokens (this also invalidates refresh tokens the app holds for them):\n   Entra: Users > <user> > Revoke sessions   |   PowerShell: Revoke-MgUserSignInSession -UserId <UPN>\n   Okta (if federated): People > <user> > More Actions > Clear User Sessions.\n   Note: already-issued access tokens can remain valid until they expire (typically about an hour). Keep monitoring for app activity during that window.\n\n4) IN-TENANT APP (persistence case): remove the malicious secrets/certificates, remove attacker-added owners, then disable or delete the app registration. Treat the account that created/modified it as compromised — reset it, revoke sessions, and review its other activity.\n\n5) BLOCK THE INFRASTRUCTURE: add reply URL and lure domains to an Umbrella block destination list; block IPs on Meraki (Layer 3 deny) and in Defender Indicators / CrowdStrike IOC management; in Avanan, quarantine the lure email from all mailboxes and block the sender.\n\nRecord every action with a timestamp.",
+      "evidence": [
+        {
+          "id": "disabled",
+          "label": "Service principal disabled (time)",
+          "type": "text"
+        },
+        {
+          "id": "grants",
+          "label": "Grants / app role assignments removed",
+          "type": "textarea"
+        },
+        {
+          "id": "revoked",
+          "label": "User sessions revoked (Entra / Okta, times)",
+          "type": "textarea"
+        },
+        {
+          "id": "infra",
+          "label": "In-tenant credential cleanup & infrastructure blocks",
+          "type": "textarea"
+        }
+      ],
+      "next": "activity-review",
+      "playbook": "CONTAINMENT"
+    },
+    "activity-review": {
+      "type": "step",
+      "title": "Determine what the app actually did",
+      "instructions": "Establish what data was accessed and what actions were taken from consent time until containment. This drives notification and escalation decisions.\n\nSIGN-IN ACTIVITY BY THE APP:\n- Entra sign-in logs: filter Application ID = <APP-ID>. Delegated use appears under 'User sign-ins (non-interactive)'; app-only use appears under 'Service principal sign-ins'. Note IPs (enrich with VirusTotal / AbuseIPDB / Shodan) and frequency.\n- Defender Advanced hunting:\n    AADSignInEventsBeta\n    | where Timestamp > datetime(<consent time>) and ApplicationId == \"<APP-ID>\"\n    | summarize count(), min(Timestamp), max(Timestamp) by AccountUpn, IPAddress, Country\n    AADSpnSignInEventsBeta\n    | where Timestamp > datetime(<consent time>) and ApplicationId == \"<APP-ID>\"\n\nDATA ACCESS (Purview audit — Audit > New search, filter by the affected users and time; or search the App ID in the full record text):\n- Mail read: MailItemsAccessed records include the ClientAppId — a spike tied to the malicious App ID means mail was read (availability depends on your audit licensing/configuration).\n- Mail sent: Send / SendAs operations — check for internal phishing sent from the victim's mailbox to spread the same consent lure.\n- Mailbox changes: New-InboxRule / Set-InboxRule / UpdateInboxRules, forwarding changes.\n- Files: FileAccessed / FileDownloaded / FileSyncDownloadedFull in SharePoint/OneDrive with the app's ID.\n- Defender Advanced hunting (needs the Microsoft 365 connector in Defender for Cloud Apps):\n    CloudAppEvents\n    | where Timestamp > datetime(<consent time>)\n    | where tostring(RawEventData) has \"<APP-ID>\"\n    | summarize count() by ActionType, AccountDisplayName, bin(Timestamp, 1h)\n- If you export Microsoft Graph activity logs to Log Analytics/Sentinel, MicrosoftGraphActivityLogs filtered by AppId shows every Graph request the app made (e.g. /me/messages, /me/drive) — the most precise record of what was touched.\n- App governance (if licensed) shows data-access volume per app.\n\nACCOUNT STATE: while you are here, check the consenting users for signs the ACCOUNT (not just the app) was compromised — sign-ins from unfamiliar IPs, new MFA methods, password changes (Entra audit logs; Okta System Log user.mfa.factor.activate / user.account.update_password).",
+      "evidence": [
+        {
+          "id": "signins",
+          "label": "App sign-in activity (users / IPs / volume / time range)",
+          "type": "textarea"
+        },
+        {
+          "id": "mail",
+          "label": "Mail read / sent / rules created",
+          "type": "textarea"
+        },
+        {
+          "id": "files",
+          "label": "Files accessed / downloaded",
+          "type": "textarea"
+        },
+        {
+          "id": "account",
+          "label": "Evidence the user account itself was compromised?",
+          "type": "textarea"
+        }
+      ],
+      "next": "account-compromised?"
+    },
+    "account-compromised?": {
+      "type": "decision",
+      "title": "Was the user account itself also compromised?",
+      "instructions": "Consent from an attacker IP/session, attacker sign-ins outside the app, new MFA methods, or password changes mean the account is compromised in addition to the app grant (common when the consent was granted using an AiTM-stolen session). A consent from the user's normal device/IP with no other anomalies means the app was the only foothold.",
+      "options": [
+        {
+          "label": "Account also compromised",
+          "next": "identity-contain",
+          "note": "Full identity remediation needed."
+        },
+        {
+          "label": "App grant was the only foothold",
+          "next": "scope",
+          "note": "Proceed to scoping."
+        }
+      ]
+    },
+    "identity-contain": {
+      "type": "step",
+      "title": "Remediate the compromised account",
+      "instructions": "- Reset the password from a clean device, confirmed with the user out-of-band (sessions were already revoked at containment — revoke again after the reset).\n- Remove MFA methods the user did not register (Entra: user > Authentication methods; Okta: reset factors) and re-enroll.\n- Remove malicious inbox rules, forwarding, and any OTHER app consents or devices the attacker added.\n- Block attacker IPs in Entra Conditional Access named locations / Okta network zones.\n- If the account is privileged, review every admin action during the compromise window — in particular other app registrations, consents, or role assignments it made.\n- Record all actions with timestamps.",
+      "evidence": [
+        {
+          "id": "reset",
+          "label": "Password reset / session revocation (times)",
+          "type": "text"
+        },
+        {
+          "id": "mfa",
+          "label": "MFA cleanup",
+          "type": "textarea"
+        },
+        {
+          "id": "cleanup",
+          "label": "Rules / other consents / devices removed",
+          "type": "textarea"
+        }
+      ],
+      "next": "scope",
+      "playbook": "CONTAINMENT"
+    },
+    "scope": {
+      "type": "step",
+      "title": "Scope the campaign",
+      "instructions": "- Every user who consented to this app: the permission grants listed in the permissions step (PrincipalId values), plus 'Consent to application' audit events for the App ID over the last 30-90 days.\n- Every user exposed to the lure: Avanan recipients of the campaign; Umbrella identities that resolved the reply URL / lure domains.\n- Look-alike apps: the same campaign often uses several app registrations. Search for recent consents to unverified external apps with similar names, reply URL domains, or permission sets:\n    Defender (CloudAppEvents): | where Timestamp > ago(30d) and ActionType has \"Consent to application\" | project Timestamp, AccountDisplayName, IPAddress, RawEventData\n    Entra: Audit logs > Activity 'Consent to application' for the last 30 days; review each app against the red-flag list.\n    PowerShell: list all service principals with delegated grants that include Mail.* or Files.* and are owned by external tenants; sort by creation date.\n- Internal spread: phishing emails sent from victim mailboxes (Purview Send events / Avanan internal mail) re-using the same lure.\n- Data exposure: summarize mailboxes/sites accessed and whether any sensitive/regulated data was involved (for legal/privacy notification decisions).",
+      "evidence": [
+        {
+          "id": "consenters",
+          "label": "All users who consented (and consent type)",
+          "type": "textarea"
+        },
+        {
+          "id": "exposed",
+          "label": "Users exposed to the lure (Avanan / Umbrella)",
+          "type": "textarea"
+        },
+        {
+          "id": "related",
+          "label": "Related / look-alike apps found",
+          "type": "textarea"
+        },
+        {
+          "id": "exposure",
+          "label": "Data exposure summary",
+          "type": "textarea"
+        }
+      ],
+      "next": "impact?",
+      "playbook": "SCOPING"
+    },
+    "impact?": {
+      "type": "decision",
+      "title": "Did the app access data or take actions?",
+      "instructions": "Any app sign-in using the grant, data access, mail sent, rule created, admin consent, application permissions, account compromise, or multiple victims = escalate. A single user-consent that was contained before the app ever signed in or touched data can be closed as contained.",
+      "options": [
+        {
+          "label": "Data accessed / actions taken / admin consent / multiple victims / account compromise",
+          "next": "escalate",
+          "note": "Escalate to IR."
+        },
+        {
+          "label": "Contained before any use — single user, no activity",
+          "next": "close-contained",
+          "note": "Close with hardening."
+        }
+      ]
+    },
+    "shadow-it": {
+      "type": "step",
+      "title": "Unsanctioned legitimate app — policy decision",
+      "instructions": "The app is a real vendor product but was consented without approval, often with broad access (mail, files, meetings).\n\n- Confirm legitimacy: verified publisher, vendor-owned reply URLs, vendor's published App ID matches, and the app's sign-in IPs belong to the vendor.\n- Confirm there is no malicious activity: app sign-ins and data access consistent with the product's purpose (Activity review queries apply).\n- Assess the data exposure: what org data is now stored by a third party (e.g. an AI note-taker recording and transcribing meetings, an email add-on reading all mail). Involve privacy/compliance if sensitive data is in scope.\n- Decide with the app owner / IT governance: APPROVE (document, and grant through admin consent with minimum permissions) or REMOVE (disable the service principal and remove grants as in the containment step, then inform the user and the vendor account owner).\n- Check how many other users consented to the same app — it may already be widespread.",
+      "evidence": [
+        {
+          "id": "legit",
+          "label": "Legitimacy confirmation (publisher / App ID / IPs)",
+          "type": "textarea"
+        },
+        {
+          "id": "exposure",
+          "label": "Data the vendor can access / has accessed",
+          "type": "textarea"
+        },
+        {
+          "id": "decision",
+          "label": "Decision (approve / remove) & who decided",
+          "type": "text"
+        },
+        {
+          "id": "prevalence",
+          "label": "Other users who consented",
+          "type": "text"
+        }
+      ],
+      "next": "close-policy"
+    },
+    "escalate": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "A malicious OAuth app obtained access and used it, or the case involves admin consent, application permissions, multiple victims, or account compromise.\n\n- Ensure the app profile, permissions, consent context and lure, containment actions, activity/data-access findings, and scope are recorded above.\n- Assign severity per your matrix — raise for admin consent, application permissions, privilege-escalation permissions, executive/finance mailboxes, or regulated data.\n- Notify the on-call IR owner; involve legal/privacy if mailbox or file content was accessed.\n- Recommend hardening for post-incident review: restrict user consent (Entra > Enterprise applications > Consent and permissions: allow user consent only for verified publishers and low-risk permissions, or disable it), enable the admin consent workflow, add App governance policies for unverified apps requesting high-risk scopes, and alerting on 'Consent to application' and on new app credentials.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Malicious OAuth app consent with data access or broad scope; app disabled, grants removed, sessions revoked, scoped and escalated to IR."
+    },
+    "close-contained": {
+      "type": "terminal",
+      "title": "Close — malicious consent contained before use",
+      "instructions": "A single user consented to a malicious app, but it was disabled and its grants removed before it signed in or accessed any data, and the account itself was not compromised.\n\n- Document the app (App ID, owner tenant, reply URLs, permissions), the lure, containment actions, and the evidence of no app activity.\n- Keep the service principal DISABLED (do not delete) so it cannot be re-consented.\n- Confirm infrastructure blocks are in place and the lure is purged from mailboxes.\n- Brief the user: a real Microsoft sign-in page can still lead to a malicious app — read the permissions screen and the app name before clicking Accept.\n- Recommend consent restrictions if user consent is currently open.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Malicious app consent contained before any use; app disabled, grants removed, infrastructure blocked, closed."
+    },
+    "close-policy": {
+      "type": "terminal",
+      "title": "Close — unsanctioned app handled per policy",
+      "instructions": "- Document the vendor, App ID, permissions, data exposure, and the approve/remove decision with the approver.\n- If removed: confirm the service principal is disabled and grants removed; notify the user(s).\n- If approved: confirm it was re-granted via admin consent with minimum permissions and added to the approved list.\n- Recommend consent restrictions / admin consent workflow so future requests go through review instead of alerting after the fact.",
+      "disposition": "other",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Legitimate but unsanctioned OAuth app; reviewed, approved or removed per policy, with consent controls recommended."
+    },
+    "sanctioned-close": {
+      "type": "terminal",
+      "title": "Close — sanctioned app, expected consent",
+      "instructions": "- Document the app, the approval reference, and why the consent was expected.\n- Propose narrow tuning (this App ID only), not a blanket exclusion.\n- If the app holds broad permissions, note it for periodic access review.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Consent to a sanctioned business app; documented and tuned."
+    }
+  }
+}
