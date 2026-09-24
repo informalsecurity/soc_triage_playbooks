@@ -1,0 +1,416 @@
+{
+  "id": "proc-mailbomb-helpdesk-impersonation",
+  "title": "Mailbombing with Teams / Phone Helpdesk Impersonation",
+  "version": "1.0",
+  "detectionType": "Email + Collaboration / Mail flood followed by external Teams chat/call or phone contact (Avanan, Teams, CrowdStrike/Defender)",
+  "severityDefault": "high",
+  "description": "A user's inbox was flooded with hundreds or thousands of legitimate-looking subscription and sign-up emails. Floods like this are commonly followed by an attacker posing as the IT help desk over an external Microsoft Teams chat or call, or by phone, who persuades the user to open Quick Assist or a remote-access tool, run commands, or give up credentials — a documented ransomware precursor. Floods are also used to bury account-takeover or fraud notifications. This procedure characterizes the flood, finds any impersonation contact, verifies endpoint and identity impact, and either contains and escalates or mitigates and closes.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "Mailbombing ('email bombing' / 'spam flooding') is the deliberate subscription of a user's address to hundreds or thousands of legitimate newsletters, sign-up forms, and mailing lists in a short window. The individual emails are 'clean' (real senders, good reputation), so they pass filters and bury the inbox.\n\nAttackers use it for one of three purposes, and triage is about figuring out which:\n1) HELPDESK IMPERSONATION PRECURSOR (most common and most dangerous): minutes to hours after the flood starts, the 'IT help desk' contacts the user via an external Microsoft Teams chat or call, or a phone call, offering to 'fix the spam'. They talk the user into opening Quick Assist or installing a remote-access tool, then deploy malware or harvest credentials. This pattern is tied to ransomware operators (e.g. Black Basta affiliates, Storm-1811 / STAC5777 activity).\n2) DISTRACTION: burying real security or financial notifications (password reset, new sign-in, MFA change, purchase or wire confirmation) while the attacker takes over an account.\n3) HARASSMENT / NOISE: no follow-up action.\n\nConfirm this is a new case (these campaigns often target several users in the same organization on the same day — check for sibling alerts/tickets) and record:\n- How it surfaced: Avanan alert/volume anomaly, user report, helpdesk ticket, or an endpoint alert (e.g. Quick Assist / RMM execution) that led you back here.\n- Targeted user(s): name, UPN, role, department. Finance, executives, IT admins, and people with public-facing emails are frequent targets.\n- Flood start time and approximate volume so far; whether it is still ongoing.\n- Whether the user has ALREADY been contacted by anyone claiming to be IT (ask immediately — see below).\n\nFIRST ACTION: contact the user through a verified internal channel (known internal phone number or in person, NOT a new Teams chat they have never seen) and tell them: IT will not contact them from an external Teams account; do not accept external Teams chats/calls; do not open Quick Assist or install anything; report any contact. Then ask whether contact has already happened.",
+      "evidence": [
+        {
+          "id": "source",
+          "label": "How it surfaced (Avanan / user report / helpdesk / endpoint alert)",
+          "type": "text"
+        },
+        {
+          "id": "user",
+          "label": "Targeted user(s) — UPN / role / department",
+          "type": "textarea"
+        },
+        {
+          "id": "flood",
+          "label": "Flood start time, volume, ongoing?",
+          "type": "text"
+        },
+        {
+          "id": "contacted",
+          "label": "Has the user been contacted by 'IT'? (initial answer)",
+          "type": "textarea"
+        }
+      ],
+      "next": "mailbomb-characterize"
+    },
+    "mailbomb-characterize": {
+      "type": "step",
+      "title": "Characterize the mail flood",
+      "instructions": "Confirm it is a mailbomb (vs. a benign mail storm) and look for anything the flood may be hiding.\n\nWHAT A MAILBOMB LOOKS LIKE:\n- Hundreds to thousands of messages over 30-120 minutes, from MANY different, mostly legitimate senders (newsletters, forums, e-commerce sites, non-profits, often in several languages).\n- Subjects like 'Confirm your subscription', 'Welcome to...', 'Verify your email', 'Thanks for registering', contact-form auto-replies.\n- Rate often spikes sharply then tapers.\n\nWHAT IT IS NOT (benign mail storms):\n- Reply-all storm: many messages from INTERNAL senders, one subject line, to a distribution list.\n- Mail loop / NDR storm: repeated bounces or auto-replies between two systems, one or two senders.\n- A legitimate bulk campaign or a sign-up the user actually made.\n\nHOW TO LOOK — Avanan:\n- Search email events for the recipient over the flood window. Note total count, how many were delivered vs. quarantined/marked spam/graymail, number of distinct sender domains, and top subjects.\n- Check whether other users received a similar spike in the same window (sort/filter by recipient and time).\n\nHOW TO LOOK — Exchange Online message trace:\n- Exchange admin center > Mail flow > Message trace: recipient = the user, last 24-48 hours; export the results.\n- PowerShell (Exchange Online module):\n    Get-MessageTraceV2 -RecipientAddress user@domain -StartDate <start> -EndDate <end> -ResultSize 5000 |\n      Group-Object SenderAddress | Sort-Object Count -Descending | Select-Object -First 50 Count, Name\n  (Older modules use Get-MessageTrace.) Count distinct senders — a mailbomb shows hundreds of distinct senders with 1-3 messages each.\n\nLOOK FOR WHAT IS BURIED (distraction check) — search the flood window for REAL notifications:\n- Keywords in subject/sender: password, reset, sign-in, new device, verification code, MFA, authenticator, order, purchase, payment, invoice, transfer, wire, direct deposit, payroll, gift card, domain, DNS.\n- Senders: your own IdP (Microsoft, Okta), banks, payroll/HR systems, cloud consoles, registrars, marketplaces.\n- A genuine security or financial notification inside the flood strongly suggests the distraction intent — go straight to identity review.\n\nDo NOT tell the user to unsubscribe from the messages individually — clicking hundreds of unknown links creates new risk and confirms the address is live.",
+      "evidence": [
+        {
+          "id": "volume",
+          "label": "Volume, rate, distinct senders, delivered vs. filtered",
+          "type": "textarea"
+        },
+        {
+          "id": "type",
+          "label": "Mailbomb vs. reply-all / loop / legit bulk — and why",
+          "type": "text"
+        },
+        {
+          "id": "buried",
+          "label": "Genuine notifications found hidden in the flood? (detail)",
+          "type": "textarea"
+        },
+        {
+          "id": "others",
+          "label": "Other users with a similar spike",
+          "type": "textarea"
+        }
+      ],
+      "next": "contact-check"
+    },
+    "contact-check": {
+      "type": "step",
+      "title": "Check for impersonation contact (Teams chat, Teams call, phone)",
+      "instructions": "Determine whether an attacker reached out to the user posing as IT, and exactly what happened in that interaction. Users often under-report or minimize — verify with logs wherever possible.\n\nWHAT THE CONTACT LOOKS LIKE:\n- Microsoft Teams chat or call from an EXTERNAL account (Teams shows an 'External' label and an Accept/Block prompt for first contact). Display names such as 'Help Desk', 'IT Support', 'Service Desk', 'Microsoft Security', sometimes spoofing your company name. The account is often in a newly created tenant like <random>.onmicrosoft.com, or a compromised third-party tenant.\n- Phone call (mobile or desk phone), often with a spoofed caller ID, sometimes using details scraped from LinkedIn.\n- Typical script: 'We see you are getting spam; we need to install a spam filter / update your mail settings; please open Quick Assist and give me the code' or 'go to this link and sign in' or 'run this command'.\n\nHOW TO LOOK — Microsoft Purview audit (Teams chats):\n- Purview portal > Audit > New search: Users = the target user, Workloads/Record types = MicrosoftTeams, time = flood start through now.\n- Relevant operations include ChatCreated, MessageSent, and MemberAdded. In the record's details, check ParticipantInfo — HasForeignTenantUsers = true indicates an external-tenant participant. Note the external user's UPN/tenant.\n- PowerShell:\n    Search-UnifiedAuditLog -StartDate <start> -EndDate <end> -UserIds user@domain -RecordType MicrosoftTeams -ResultSize 5000 |\n      Select CreationDate, Operations, AuditData\n\nHOW TO LOOK — Defender Advanced hunting (requires the Microsoft 365 app connector in Defender for Cloud Apps):\n    CloudAppEvents\n    | where Timestamp > datetime(<flood start>)\n    | where Application == \"Microsoft Teams\" and ActionType in (\"ChatCreated\",\"MessageSent\",\"MemberAdded\")\n    | where tostring(RawEventData) has \"<user UPN>\"\n    | extend Foreign = tostring(RawEventData.ParticipantInfo.HasForeignTenantUsers)\n    | where Foreign == \"true\"\n    | project Timestamp, ActionType, AccountDisplayName, AccountId, RawEventData\n\nHOW TO LOOK — Teams calls:\n- Teams admin center > Users > Manage users > <user> > Meetings & calls: recent calls with participants, external callers, duration.\n- If the user has Teams Phone, the same view shows PSTN numbers (useful for a spoofed/external number).\n- Long calls (10-60 min) with an external participant shortly after the flood are a strong signal.\n\nHOW TO LOOK — Avanan (if Teams protection is enabled): review Teams events for messages from external senders to the user, including any links or files shared in chat.\n\nUSER INTERVIEW (verified channel; calm, non-blaming):\n- Did anyone contact you about the spam? How (Teams chat, Teams call, phone, email)? What name/number/account?\n- Did you accept the chat/call? What did they ask you to do?\n- Did you open Quick Assist, share your screen, 'give control', install anything, visit a link, sign in anywhere, read out a code, or approve an MFA prompt?\n- Ask for screenshots of the chat BEFORE it is deleted, and do not let the user block/delete the conversation until you have captured it.\n\nCollect every URL, file name, phone number, and external account shared during the contact — they are IOCs.",
+      "evidence": [
+        {
+          "id": "channel",
+          "label": "Contact channel (Teams chat / Teams call / phone / email / none found)",
+          "type": "text"
+        },
+        {
+          "id": "actor",
+          "label": "Attacker account / tenant / display name / phone number",
+          "type": "textarea"
+        },
+        {
+          "id": "audit",
+          "label": "Purview / Teams call history findings (times, duration, operations)",
+          "type": "textarea"
+        },
+        {
+          "id": "asks",
+          "label": "What the user was asked to do and what they did (user account)",
+          "type": "textarea"
+        },
+        {
+          "id": "iocs",
+          "label": "URLs / files / numbers shared during contact",
+          "type": "textarea"
+        }
+      ],
+      "next": "intent?"
+    },
+    "intent?": {
+      "type": "decision",
+      "title": "What does the evidence indicate?",
+      "instructions": "Choose the highest-risk option the evidence supports.\n- Any impersonation contact (even if the user says they declined) goes to endpoint verification — users frequently leave out that they 'just opened Quick Assist for a second'.\n- Genuine security/financial notifications hidden in the flood, without contact, point to account takeover — go to identity review.\n- Mailbomb with no contact and no buried notifications is noise/pre-contact — mitigate and monitor, because contact may still be coming.\n- A reply-all storm, mail loop, or legitimate bulk mail is not an attack.",
+      "options": [
+        {
+          "label": "Impersonation contact occurred (Teams / phone / email)",
+          "next": "endpoint-verify",
+          "note": "Verify what happened on the endpoint."
+        },
+        {
+          "label": "Flood used to hide account/financial notifications (no contact)",
+          "next": "identity-review",
+          "note": "Distraction for account takeover."
+        },
+        {
+          "label": "Mailbomb only — no contact, nothing buried (yet)",
+          "next": "mitigate",
+          "note": "Suppress, block, and warn; contact may follow."
+        },
+        {
+          "label": "Not a mailbomb — reply-all storm / mail loop / legit bulk",
+          "next": "benign-close",
+          "note": "Benign mail event."
+        }
+      ]
+    },
+    "endpoint-verify": {
+      "type": "step",
+      "title": "Verify endpoint activity during and after the contact",
+      "instructions": "Check the user's device(s) for remote-access sessions and anything executed during the contact window. Use the flood start time through the present, and pay closest attention to the call/chat window.\n\n1) QUICK ASSIST (built into Windows — the most abused tool in this pattern):\n- The victim (the 'sharer') launches Quick Assist and types a 6-character code the attacker reads out; the attacker then gets view or full control.\n- Defender KQL:\n    DeviceProcessEvents\n    | where Timestamp > datetime(<flood start>) and FileName =~ \"QuickAssist.exe\"\n    | project Timestamp, DeviceName, AccountName, FolderPath, ProcessCommandLine\n    DeviceNetworkEvents\n    | where Timestamp > datetime(<flood start>) and RemoteUrl has \"remoteassistance.support.services.microsoft.com\"\n    | project Timestamp, DeviceName, InitiatingProcessFileName, RemoteUrl, RemoteIP\n- CrowdStrike (Advanced event search):\n    #event_simpleName=ProcessRollup2 FileName=/^quickassist\\.exe$/i | table([@timestamp, ComputerName, UserName, FilePath])\n    #event_simpleName=DnsRequest DomainName=/remoteassistance\\.support\\.services\\.microsoft\\.com/i | table([@timestamp, ComputerName])\n- Umbrella Activity Search: resolutions of remoteassistance.support.services.microsoft.com by this identity during the window. Quick Assist use by a normal user who is not in an IT support session is suspicious on its own.\n\n2) OTHER REMOTE-ACCESS TOOLS (installed or run portable during the call): AnyDesk, TeamViewer, ScreenConnect/ConnectWise Control, Zoho Assist, RustDesk, SimpleHelp, Splashtop, Atera, NetSupport, Level.\n- Defender: DeviceProcessEvents | where Timestamp > datetime(<flood start>) and DeviceName startswith \"<HOST>\" and (ProcessVersionInfoProductName has_any (\"AnyDesk\",\"TeamViewer\",\"ScreenConnect\",\"Zoho\",\"RustDesk\",\"SimpleHelp\",\"Splashtop\",\"NetSupport\") or FileName has_any (\"anydesk\",\"teamviewer\",\"screenconnect\",\"rustdesk\",\"client32\"))\n- CrowdStrike: #event_simpleName=ProcessRollup2 ComputerName=<HOST> FileName=/(anydesk|teamviewer|screenconnect|rustdesk|zoho|simplehelp|splashtop|client32)/i\n- Umbrella: resolutions in the 'Remote Access' style categories or vendor domains (anydesk.com, teamviewer.com, screenconnect.com, etc.).\n- Also note Teams screen-share 'Give control' — it leaves no separate process. If the user shared their screen in the call, treat every process launched interactively during the call as potentially attacker-driven.\n\n3) EVERYTHING LAUNCHED DURING THE CONTACT WINDOW:\n- Defender:\n    DeviceProcessEvents\n    | where DeviceName startswith \"<HOST>\" and Timestamp between (datetime(<contact start>) .. datetime(<contact end + 2h>))\n    | where InitiatingProcessFileName in~ (\"explorer.exe\",\"cmd.exe\",\"powershell.exe\",\"QuickAssist.exe\",\"msedge.exe\",\"chrome.exe\") or FileName in~ (\"cmd.exe\",\"powershell.exe\",\"curl.exe\",\"msiexec.exe\",\"rundll32.exe\",\"javaw.exe\",\"pythonw.exe\",\"ssh.exe\")\n    | project Timestamp, InitiatingProcessFileName, FileName, ProcessCommandLine, FolderPath, SHA256\n- CrowdStrike: #event_simpleName=ProcessRollup2 ComputerName=<HOST> | @timestamp between the contact window | table([@timestamp, ParentBaseFileName, FileName, CommandLine, FilePath])\n\nKNOWN TRADECRAFT TO RECOGNIZE:\n- Browser download of a ZIP/MSI/EXE/JAR from a file-sharing or newly registered domain, presented as a 'spam filter update' or 'anti-spam patch'.\n- A fake 'spam filter' page or pop-up asking the user to enter their password (credential harvesting — also check identity).\n- DLL sideloading: a legitimate signed binary copied to a user-writable folder next to a malicious DLL (e.g. OneDriveStandaloneUpdater.exe with a planted winhttp.dll in an unusual path).\n- javaw.exe running a JAR from %APPDATA%/%TEMP%, pythonw.exe running a script from a user folder, curl/PowerShell download cradles (same patterns as ClickFix).\n- ssh.exe with -R (reverse tunnel) to an internet IP — Meraki will show outbound TCP/22 from a workstation, which is unusual.\n- Immediate discovery commands: whoami, net user /domain, nltest /dclist, systeminfo, ipconfig /all.\n\nEnrich every file hash, URL, domain, and IP in VirusTotal; IPs in Shodan and AbuseIPDB; URLs in urlscan.io (private scans); hashes in MalwareBazaar.",
+      "evidence": [
+        {
+          "id": "quickassist",
+          "label": "Quick Assist executed/connected? (times)",
+          "type": "textarea"
+        },
+        {
+          "id": "rmm",
+          "label": "Other remote-access tools / screen control observed",
+          "type": "textarea"
+        },
+        {
+          "id": "processes",
+          "label": "Processes launched during contact window (notable ones)",
+          "type": "textarea"
+        },
+        {
+          "id": "downloads",
+          "label": "Downloads / files written / credential-prompt pages",
+          "type": "textarea"
+        },
+        {
+          "id": "intel",
+          "label": "IOC enrichment (VirusTotal / Shodan / urlscan / AbuseIPDB)",
+          "type": "textarea"
+        }
+      ],
+      "next": "access-verdict?"
+    },
+    "access-verdict?": {
+      "type": "decision",
+      "title": "Did the attacker gain access?",
+      "instructions": "- Remote session established (Quick Assist, RMM, Teams control), attacker-directed commands, or any file/tool dropped = endpoint compromise, regardless of how short the session was. Operators in this pattern can stage malware within minutes.\n- User typed credentials into an attacker page, read out an MFA code, or approved a push — with no endpoint access — is an identity compromise path.\n- Contact happened but logs AND the user account show no session, no execution, and no credential disclosure = attempted, not successful.",
+      "options": [
+        {
+          "label": "Remote access / execution / tooling on the endpoint",
+          "next": "contain-host",
+          "note": "Treat as active intrusion."
+        },
+        {
+          "label": "Credentials or MFA disclosed, no endpoint access",
+          "next": "identity-review",
+          "note": "Identity compromise path."
+        },
+        {
+          "label": "No access — contact declined/failed, verified in logs",
+          "next": "mitigate",
+          "note": "Block and close as attempted."
+        }
+      ]
+    },
+    "contain-host": {
+      "type": "step",
+      "title": "Contain the host (capture volatile evidence first)",
+      "instructions": "An attacker has had interactive access. In this pattern that is a known ransomware precursor — contain quickly. Tell the user not to reboot or log off, and to end any active call/remote session.\n\nCAPTURE (a few minutes):\n- CrowdStrike RTR: ps, netstat, 'get' any dropped files, 'memdump <pid>' of suspicious processes, 'reg query' Run keys under HKEY_USERS\\<SID>.\n- Defender Live Response: processes, connections, getfile; 'Collect investigation package' from the device page.\n\nCONTAIN:\n- Isolate the host: CrowdStrike 'Network contain' / Defender 'Isolate device' (EDR and remote-shell access keep working).\n- Kill remote-access sessions and processes (QuickAssist.exe, RMM agents, reverse SSH, payloads); remove RMM installs after collection.\n- Block the attacker's Teams tenant/domain: Teams admin center > Users > External access > add the domain to the blocked list (or switch to an allow-list model). Also block the specific external account where possible.\n- Block IOCs fleet-wide: Umbrella destination list (domains), Meraki Layer 3 deny rules (IPs), CrowdStrike IOC management (hashes/domains), Defender Indicators (files/URLs/IPs).\n- Identity: revoke sessions and reset the password now (from a clean device) — Entra: Users > <user> > Revoke sessions; Okta: People > <user> > More Actions > Clear User Sessions (include tokens). Assume anything typed during the session was captured.\n- Record all actions with timestamps.",
+      "evidence": [
+        {
+          "id": "volatile",
+          "label": "Volatile evidence captured",
+          "type": "textarea"
+        },
+        {
+          "id": "isolation",
+          "label": "Host isolation (platform / time)",
+          "type": "text"
+        },
+        {
+          "id": "blocks",
+          "label": "Sessions killed, RMM removed, Teams domain & IOC blocks",
+          "type": "textarea"
+        },
+        {
+          "id": "creds",
+          "label": "Sessions revoked & password reset (Entra / Okta)",
+          "type": "textarea"
+        }
+      ],
+      "next": "session-analysis",
+      "playbook": "CONTAINMENT"
+    },
+    "session-analysis": {
+      "type": "step",
+      "title": "Reconstruct what the operator did",
+      "instructions": "Build a full picture of attacker activity from the start of the remote session onward.\n\n- Full process tree under QuickAssist.exe / the RMM agent / explorer.exe during the session, and every descendant of anything dropped (pivot on ProcessId/InitiatingProcessId in Defender; TargetProcessId/ParentProcessId in CrowdStrike).\n- Payloads: hash and enrich every dropped file (VirusTotal, MalwareBazaar, sandbox such as ANY.RUN/Joe Sandbox/Hybrid Analysis with private submission). Families historically seen in this pattern include Cobalt Strike, QakBot-lineage 'BackConnect' tooling, Java and Python-based backdoors, and sideloaded DLL loaders — but classify from the evidence, not the expectation.\n- Persistence: Run/RunOnce keys, scheduled tasks, services, startup folder (CrowdStrike: #event_simpleName=/^(AsepValueUpdate|ScheduledTaskRegistered)$/; Defender: DeviceRegistryEvents on \\CurrentVersion\\Run, DeviceEvents ActionType == \"ScheduledTaskCreated\").\n- Credential access: fake credential prompts (scripts or EXEs that pop a login box and write the password to a file), LSASS access, browser credential store access.\n- Discovery and lateral movement: whoami, net, nltest, AdFind, SharpHound; outbound RDP/SMB/WinRM (3389/445/5985/5986) to internal hosts.\n    Defender: DeviceNetworkEvents | where DeviceName startswith \"<HOST>\" and Timestamp > datetime(<session start>) and RemotePort in (22, 3389, 445, 5985, 5986)\n    CrowdStrike: #event_simpleName=NetworkConnectIP4 ComputerName=<HOST> RemotePort=/^(22|3389|445|5985|5986)$/\n- C2: all outbound destinations after the session start — enrich in VirusTotal/Shodan/AbuseIPDB. Umbrella for domain lookups; Meraki (Security center / client traffic / flow logs in SIEM) for IP-only traffic and volume.\n- Data staging/exfil: archives created (zip/7z/rar), large outbound transfers, cloud-storage uploads.",
+      "evidence": [
+        {
+          "id": "tree",
+          "label": "Operator process tree / commands",
+          "type": "textarea"
+        },
+        {
+          "id": "payloads",
+          "label": "Payloads (path / hash / family / sandbox)",
+          "type": "textarea"
+        },
+        {
+          "id": "persistence",
+          "label": "Persistence created",
+          "type": "textarea"
+        },
+        {
+          "id": "lateral",
+          "label": "Discovery / credential access / lateral movement",
+          "type": "textarea"
+        },
+        {
+          "id": "c2",
+          "label": "C2 and exfil destinations (enriched)",
+          "type": "textarea"
+        }
+      ],
+      "next": "identity-review"
+    },
+    "identity-review": {
+      "type": "step",
+      "title": "Review identity for compromise",
+      "instructions": "Determine whether the user's accounts were accessed or modified by the attacker — either via credentials/MFA given during the call, captured during a remote session, or during the distraction window.\n\nMICROSOFT ENTRA ID:\n- Sign-in logs (interactive and non-interactive) from the flood start onward: new IPs/ASNs/countries, VPS/hosting providers, unfamiliar devices or user agents, MFA satisfied from an unfamiliar IP (suggests a code/push was given away).\n- Identity Protection > Risk detections for the user.\n- Audit logs: password reset (including self-service reset the attacker walked the user through), new MFA method registered, new device joined/registered, app consents, role changes.\n- Exchange: new inbox rules (forward, delete, move to obscure folders), forwarding set, mail sent during the window. The attacker may also have created rules to hide replies.\n- Defender Advanced hunting:\n    AADSignInEventsBeta\n    | where AccountUpn =~ \"<user@domain>\" and Timestamp > datetime(<flood start>)\n    | project Timestamp, Application, IPAddress, Country, UserAgent, ErrorCode, AuthenticationRequirement, RiskLevelDuringSignIn\n\nOKTA:\n- Reports > System Log: actor.alternateId eq \"<user@domain>\" from the flood start.\n- MFA-fatigue / push approval: user.authentication.auth_via_mfa events (successes and denials); a burst of denied pushes followed by an approval during the call is a red flag. Check client IP/ASN against the user's normal pattern.\n- New factors: eventType eq \"user.mfa.factor.activate\" or factor resets; password changes (user.account.update_password, user.account.reset_password).\n- New sessions: user.session.start from unfamiliar IPs, and the apps accessed after (system.sso / app.* events).\n\nHELPDESK SIDE: check whether anyone called YOUR helpdesk impersonating this user to reset their password or MFA during the same window — this pattern sometimes runs in both directions.\n\nDISTRACTION PATH: for each genuine notification found buried in the flood, confirm whether the underlying action (password change, purchase, transfer, payroll/direct-deposit change) was legitimate. Engage finance/HR/payroll immediately if money movement or payroll changes are involved.",
+      "evidence": [
+        {
+          "id": "entra",
+          "label": "Entra findings (sign-ins / risk / MFA / resets / inbox rules)",
+          "type": "textarea"
+        },
+        {
+          "id": "okta",
+          "label": "Okta findings (pushes / factors / sessions / new IPs)",
+          "type": "textarea"
+        },
+        {
+          "id": "helpdesk",
+          "label": "Helpdesk impersonation of the user? / buried notifications validated",
+          "type": "textarea"
+        },
+        {
+          "id": "verdict",
+          "label": "Account accessed or modified by attacker? (yes/no + detail)",
+          "type": "text"
+        }
+      ],
+      "next": "identity-verdict?"
+    },
+    "identity-verdict?": {
+      "type": "decision",
+      "title": "Was an identity compromised?",
+      "instructions": "Any attacker sign-in, MFA method added, password reset, inbox rule, consent, or fraudulent transaction = identity compromise. If the host was already contained for endpoint compromise but identity is clean, continue to scoping. If neither host nor identity was compromised, mitigate and close.",
+      "options": [
+        {
+          "label": "Identity compromised",
+          "next": "identity-contain",
+          "note": "Contain the account(s)."
+        },
+        {
+          "label": "Identity clean — but host was compromised (already contained)",
+          "next": "scope",
+          "note": "Proceed to scoping."
+        },
+        {
+          "label": "Identity clean — no host compromise",
+          "next": "mitigate",
+          "note": "Attempt only; mitigate and close."
+        }
+      ]
+    },
+    "identity-contain": {
+      "type": "step",
+      "title": "Contain the compromised identity",
+      "instructions": "- Revoke all sessions in Entra (Revoke sessions) and Okta (Clear User Sessions, including OAuth tokens), then reset the password from a clean device, confirmed with the user out-of-band.\n- Remove any MFA methods/factors the user did not register; re-enroll with verified identity. In Okta, reset factors if any doubt remains.\n- Remove malicious inbox rules, forwarding, OAuth app consents, and attacker-registered devices.\n- Block attacker IPs/ranges in Entra Conditional Access named locations and Okta network zones where appropriate.\n- If the user is privileged, review admin actions taken during the compromise window and consider temporarily removing roles.\n- Engage finance/HR if fraudulent transactions or payroll changes are involved (time-sensitive for recovery).\n- Record all actions with timestamps.",
+      "evidence": [
+        {
+          "id": "actions",
+          "label": "Session revocation, password reset, MFA cleanup (times)",
+          "type": "textarea"
+        },
+        {
+          "id": "artifacts",
+          "label": "Malicious rules / consents / devices removed",
+          "type": "textarea"
+        },
+        {
+          "id": "fraud",
+          "label": "Fraud/payroll/business follow-up initiated",
+          "type": "text"
+        }
+      ],
+      "next": "scope",
+      "playbook": "CONTAINMENT"
+    },
+    "mitigate": {
+      "type": "step",
+      "title": "Mitigate, block, and hunt for other targets",
+      "instructions": "No compromise was found for this user, but these campaigns usually target several people and contact may still be coming.\n\nSUPPRESS THE FLOOD:\n- Avanan: bulk-quarantine/purge the flood messages from the user's mailbox so they can work, and apply temporary tighter filtering for this recipient if available.\n- Optionally a temporary Exchange transport rule for the recipient that quarantines messages matching subscription-confirmation patterns — set a reminder to remove it (floods usually subside within 24-72 hours).\n\nBLOCK THE ATTACKER:\n- Teams: block the attacker's external domain/tenant (Teams admin center > Users > External access). Consider organization-wide controls: allow-list-only external access, blocking chats with unmanaged (consumer) Teams accounts, or at minimum keeping the external Accept/Block prompt in place.\n- Umbrella / Meraki / CrowdStrike / Defender: block any URLs, domains, IPs, or hashes collected from the contact.\n\nHUNT FOR OTHER TARGETS (last 7 days):\n- Mail spikes: Avanan or message trace — recipients with an abnormal number of distinct senders in a short window.\n- Teams: Purview audit / CloudAppEvents for ChatCreated with HasForeignTenantUsers = true involving the same external tenant or 'help desk' display names across ALL users.\n- Quick Assist fleet-wide:\n    Defender: DeviceProcessEvents | where Timestamp > ago(7d) and FileName =~ \"QuickAssist.exe\" | summarize count() by DeviceName, AccountName\n    CrowdStrike: #event_simpleName=ProcessRollup2 FileName=/^quickassist\\.exe$/i | groupBy([ComputerName, UserName])\n  Validate each hit against legitimate IT support sessions.\n\nCOMMUNICATE: brief the user (and, if several were targeted, the wider organization or affected departments): the IT helpdesk will never contact you from an external Teams account, and will never ask you to open Quick Assist unsolicited. Brief the helpdesk to expect callbacks and to verify any user asking for resets.",
+      "evidence": [
+        {
+          "id": "suppress",
+          "label": "Flood suppression actions (Avanan / transport rule + removal date)",
+          "type": "textarea"
+        },
+        {
+          "id": "blocks",
+          "label": "Teams domain & IOC blocks applied",
+          "type": "textarea"
+        },
+        {
+          "id": "hunt",
+          "label": "Other targeted users / contacts / Quick Assist hits",
+          "type": "textarea"
+        },
+        {
+          "id": "comms",
+          "label": "User / org / helpdesk communications",
+          "type": "text"
+        }
+      ],
+      "next": "campaign-verdict?"
+    },
+    "campaign-verdict?": {
+      "type": "decision",
+      "title": "Did the hunt find other users who engaged?",
+      "instructions": "Other users who only received a flood or an unaccepted chat request should be warned and blocked for. Any other user who accepted contact, ran Quick Assist/RMM, or disclosed credentials needs their own investigation starting from endpoint verification.",
+      "options": [
+        {
+          "label": "Other users engaged (accepted contact / remote access / creds)",
+          "next": "endpoint-verify",
+          "note": "Run endpoint verification for each engaged user."
+        },
+        {
+          "label": "No other engagement found",
+          "next": "close-no-compromise",
+          "note": "Close with blocks and comms in place."
+        }
+      ]
+    },
+    "scope": {
+      "type": "step",
+      "title": "Scope the campaign and blast radius",
+      "instructions": "- All targeted users (mail spikes), all contacted users (Teams audit / call history / user reports), and all users who engaged (Quick Assist / RMM / credential disclosure).\n- Fleet hunt for every payload hash, C2 domain/IP, and dropped file name (CrowdStrike IOC management 'hosts seen', Defender DeviceFileEvents/DeviceNetworkEvents, Umbrella across all identities, Meraki for IP-based traffic).\n- Lateral movement from compromised hosts and any use of compromised accounts on other systems (Entra/Okta sign-ins, AD authentication logs).\n- Timeline: flood start -> contact -> remote session/credential disclosure -> payload -> persistence/C2 -> lateral/identity misuse -> containment.\n- Data and systems reachable by the compromised host(s) and account(s); any evidence of staging or exfiltration.",
+      "evidence": [
+        {
+          "id": "users",
+          "label": "Targeted / contacted / engaged users",
+          "type": "textarea"
+        },
+        {
+          "id": "hunt",
+          "label": "Fleet hunt results (hosts / IOCs)",
+          "type": "textarea"
+        },
+        {
+          "id": "timeline",
+          "label": "Timeline: flood -> contact -> access -> payload -> containment",
+          "type": "textarea"
+        },
+        {
+          "id": "reach",
+          "label": "Affected hosts & accounts, data reachable, exfil evidence",
+          "type": "textarea"
+        }
+      ],
+      "next": "escalate",
+      "playbook": "SCOPING"
+    },
+    "escalate": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "Helpdesk-impersonation or distraction attack resulted in endpoint and/or identity compromise; containment and scope established.\n\n- Ensure the flood analysis, contact evidence (screenshots, audit records, call history), endpoint session reconstruction, payloads, identity findings, timeline, and containment actions are recorded above.\n- Assign severity per your matrix — this pattern is a known ransomware precursor; raise severity for any hands-on-keyboard activity, lateral movement, or privileged accounts.\n- Notify the on-call IR owner and hand over preserved evidence.\n- Note hardening for post-incident review: restrict Teams external access (allow-list), block or remove Quick Assist where not used by IT (Intune/AppLocker), enforce an approved-RMM allow-list and block others (EDR + Umbrella), phishing-resistant MFA / number matching, and a documented helpdesk identity-verification procedure.\n- Reimage compromised hosts under the IR playbook.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Mailbomb-driven helpdesk impersonation or distraction led to compromise; host/identity contained, campaign scoped, escalated to IR."
+    },
+    "close-no-compromise": {
+      "type": "terminal",
+      "title": "Close — mailbomb / impersonation attempt, no compromise",
+      "instructions": "A mailbomb (with or without an impersonation attempt) was confirmed, but no endpoint access or identity compromise occurred for this or any other user.\n\n- Document the flood characteristics, any contact evidence, the verification that nothing was executed or disclosed, and the identity review result.\n- Confirm blocks are in place (Teams external domain, IOCs) and any temporary mail rules have a removal date.\n- Record user/helpdesk communications. Consider a follow-up check in 24-72 hours, since contact sometimes arrives after the flood.\n- If Teams external access or Quick Assist exposure contributed, note it as a control-improvement recommendation.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Mailbomb/impersonation attempt with no endpoint or identity compromise; blocked, users warned, closed."
+    },
+    "benign-close": {
+      "type": "terminal",
+      "title": "Close — benign mail storm (not a mailbomb)",
+      "instructions": "The volume came from a reply-all storm, mail loop/NDR storm, or legitimate bulk mail.\n\n- Document the cause and evidence (internal senders / single subject / loop between two systems / legitimate campaign).\n- Hand off to messaging/IT to fix the root cause (distribution list permissions, reply-all protection, broken auto-forward or auto-reply).\n- Propose tuning if the alert logic can distinguish these cases.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Mail volume caused by a benign storm/loop/bulk mail, not an attack; root cause handed off and closed."
+    }
+  }
+}
