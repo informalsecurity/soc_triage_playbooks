@@ -1,0 +1,252 @@
+{
+  "id": "proc-device-code-phishing",
+  "title": "Device Code Phishing",
+  "version": "1.0",
+  "detectionType": "Identity / Suspicious OAuth device code flow sign-in (Entra ID, Defender XDR)",
+  "severityDefault": "high",
+  "description": "A user may have been tricked into entering an attacker-generated code at Microsoft's genuine device login page, granting the attacker access and refresh tokens for the user's account — without any phishing website or password theft. The sign-in appears to come from the user's own IP and device; the malicious activity is the token use that follows from attacker infrastructure, often with a newly registered device for persistence. This procedure finds the device-code sign-in, follows the tokens, revokes them and removes attacker devices, identifies the lure, reviews attacker activity, and scopes the campaign.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "Device code phishing abuses a legitimate Microsoft sign-in method — the OAuth 'device code flow' — which exists so devices without a keyboard or browser (smart TVs, meeting-room systems, command-line tools) can sign in. Normally the device shows a short code and the user types it at microsoft.com/devicelogin on their phone or PC.\n\nIn the attack, the ATTACKER starts the flow, receives the code, and sends it to the victim with a pretext ('enter this code to join the meeting / open the secure document / verify your account'). The victim goes to the REAL Microsoft page, enters the code, signs in with their password and MFA, and clicks Continue on a prompt naming a Microsoft app (e.g. 'Microsoft Office'). Microsoft then issues the access and refresh tokens to the attacker's waiting session.\n\nWhy it is hard to spot:\n- No phishing website, no stolen password — the user typed everything into genuine Microsoft pages. Umbrella sees only normal Microsoft domains.\n- The suspicious sign-in comes from the USER'S OWN IP and device (unlike AiTM, where the capture sign-in comes from the phishing proxy).\n- Attackers usually request tokens for Microsoft first-party apps (e.g. Microsoft Office, Teams, Azure CLI, Microsoft Authentication Broker). These belong to a 'family' of Microsoft clients whose refresh tokens can be exchanged for access to other Microsoft services — so one code typically gives the attacker mail, files, Teams, and Graph access.\n- Codes expire after about 15 minutes, so lures are real-time: a live Teams/WhatsApp/Signal chat, a 'meeting starting now' invite, or a lure page that generates a fresh code the moment the victim clicks.\n\nThis technique has been used heavily by state-aligned actors (e.g. Microsoft-tracked Storm-2372) and by commodity phishing kits.\n\nConfirm this is a new case and record:\n- Alert source: Entra ID Protection / Defender XDR alert, a custom detection on device code sign-ins, Avanan alert on a lure, or user report ('someone asked me to enter a code').\n- User: UPN, role, privilege. Executives, government/policy-facing staff, and admins are favored targets.\n- The device-code sign-in time, application name/ID, IP, and device.\n- Any automatic remediation already applied (sessions revoked, user disabled).",
+      "evidence": [
+        {
+          "id": "source",
+          "label": "Alert source / detection / automatic actions",
+          "type": "textarea"
+        },
+        {
+          "id": "user",
+          "label": "User (UPN / role / privilege)",
+          "type": "textarea"
+        },
+        {
+          "id": "signin",
+          "label": "Device-code sign-in: time / app / IP / device",
+          "type": "textarea"
+        }
+      ],
+      "next": "devicecode-signins"
+    },
+    "devicecode-signins": {
+      "type": "step",
+      "title": "Find the device-code sign-in and follow the token",
+      "instructions": "Two things to establish: (1) the device-code sign-in itself, and (2) where the resulting tokens were USED from afterward. The second is what proves phishing.\n\nWHAT MALICIOUS LOOKS LIKE:\n- STEP 1 — Device-code sign-in (interactive): Authentication protocol = Device code; IP/location = the user's normal IP (they did it themselves); application = a Microsoft first-party client such as Microsoft Office, Microsoft Teams, Microsoft Azure CLI, Microsoft Azure PowerShell, or Microsoft Authentication Broker; MFA performed by the user. Often the user has never used device code before.\n- STEP 2 — Token use (mostly NON-interactive sign-ins): within seconds or minutes, sign-ins for the same user from a DIFFERENT IP — usually a VPS/hosting provider, VPN, or proxy — with MFA satisfied by the token, accessing Exchange Online, Microsoft Graph, SharePoint, or Teams. In Entra these later sign-ins show an 'original transfer method' of device code flow, linking them back to step 1.\n- STEP 3 — Persistence (frequent): a NEW device registered to the user shortly after, via the Microsoft Authentication Broker client. A registered device can obtain a Primary Refresh Token, which gives long-term access that survives a simple session revocation unless the device is removed.\n\nWHAT LEGITIMATE DEVICE CODE USE LOOKS LIKE:\n- Engineers/admins using Azure CLI or PowerShell modules with device login, meeting-room or shared devices, some kiosk/IoT setups.\n- Tell: the token is then used from the SAME IP / managed device as the sign-in, the app fits the user's job, and the user can explain it — and it recurs as part of their normal pattern.\n\nHOW TO LOOK — Entra admin center (Monitoring & health > Sign-in logs):\n- Add filter 'Authentication protocol' = Device code. Set the date range to 30 days. This shows every device-code sign-in, for this user and tenant-wide (useful for scoping later).\n- Open the user's device-code sign-in: note Application + App ID, IP, Device info, Correlation ID, Session ID, and Conditional Access results.\n- Then switch to 'User sign-ins (non-interactive)' for the same user from that time forward: look for new IPs, and in the sign-in details the original transfer method (device code flow) and matching Session ID.\n- Audit logs (Target = user): 'Register device', 'Add registered owner to device', 'Add registered users to device', 'User registered security info' after the sign-in.\n\nHOW TO LOOK — Microsoft Graph PowerShell (beta sign-in resource includes the protocol):\n    Get-MgBetaAuditLogSignIn -Filter \"userPrincipalName eq '<user@domain>' and authenticationProtocol eq 'deviceCode'\" -All |\n      Select CreatedDateTime, AppDisplayName, AppId, IpAddress, @{n='Loc';e={$_.Location.City}}, @{n='Status';e={$_.Status.ErrorCode}}\n\nHOW TO LOOK — if Entra sign-in logs stream to Log Analytics / Sentinel (column names can vary slightly by workspace):\n    SigninLogs\n    | where TimeGenerated > ago(30d) and AuthenticationProtocol == \"deviceCode\"\n    | project TimeGenerated, UserPrincipalName, AppDisplayName, AppId, IPAddress, Location, ResultType, DeviceDetail\n\nHOW TO LOOK — Defender Advanced hunting (token use after the event):\n    AADSignInEventsBeta\n    | where AccountUpn =~ \"<user@domain>\" and Timestamp > datetime(<device code sign-in time>)\n    | project Timestamp, LogonType, Application, ApplicationId, IPAddress, Country, UserAgent, DeviceName, IsManaged, ErrorCode, SessionId\n    | order by Timestamp asc\n\nOKTA (if Microsoft 365 is federated to Okta): the user's sign-in for the device code flow will show in Okta's System Log as a normal user.authentication.sso into Office 365 from the user's IP — consistent with the user doing it themselves, and NOT a sign of innocence. The attacker's token use happens on the Microsoft side and will not appear in Okta. (If you use Okta's own device authorization grant for custom apps, review token grants for those apps separately.)\n\nENRICH the token-use IPs: ASN/owner (ipinfo.io), Spur (residential proxy / VPN), AbuseIPDB, VirusTotal, Shodan.",
+      "evidence": [
+        {
+          "id": "dcsignin",
+          "label": "Device-code sign-in (time / app + App ID / IP / device / MFA)",
+          "type": "textarea"
+        },
+        {
+          "id": "tokenuse",
+          "label": "Subsequent token use (IPs / apps / times) with enrichment",
+          "type": "textarea"
+        },
+        {
+          "id": "device",
+          "label": "Devices registered / security info added after the sign-in",
+          "type": "textarea"
+        },
+        {
+          "id": "history",
+          "label": "Does the user normally use device code? (prior history)",
+          "type": "text"
+        }
+      ],
+      "next": "verdict?"
+    },
+    "verdict?": {
+      "type": "decision",
+      "title": "Is this device code phishing?",
+      "instructions": "- Malicious: tokens from the device-code sign-in were used from infrastructure other than the user's (especially hosting/VPN/proxy), a device was registered right after, the user has no history of device code use, or the user confirms receiving a code from someone.\n- Legitimate: the user (typically technical) ran a CLI/tool with device login, token use stays on the same IP/managed device, and the user confirms it through a trusted channel.\n- If the user does not recall entering a code — or cannot be reached — treat it as malicious.",
+      "options": [
+        {
+          "label": "Device code phishing confirmed or likely",
+          "next": "contain",
+          "note": "Contain immediately."
+        },
+        {
+          "label": "Legitimate device code use (verified)",
+          "next": "benign-close",
+          "note": "False positive; document and tune."
+        }
+      ]
+    },
+    "contain": {
+      "type": "step",
+      "title": "Contain — kill the tokens and the device",
+      "instructions": "The attacker holds a refresh token (and possibly a registered device). They do NOT know the password, so the priority is token and device removal — a password reset alone does nothing here.\n\n1) If attacker activity is ongoing, block sign-in temporarily: Entra > Users > <user> > Edit properties > uncheck 'Account enabled'.\n\n2) REVOKE all refresh tokens and sessions:\n   Entra: Users > <user> > Revoke sessions   |   PowerShell: Revoke-MgUserSignInSession -UserId <UPN>\n   Okta (if federated): People > <user> > More Actions > Clear User Sessions — this ends the Okta session but does NOT revoke Microsoft tokens; the Entra revocation is the one that matters.\n\n3) DELETE attacker-registered devices (critical — a registered device can hold a Primary Refresh Token):\n   Entra: Users > <user> > Devices — remove any device registered at or after the device-code sign-in that the user does not own. PowerShell: Get-MgUserRegisteredDevice -UserId <UPN>; then Remove-MgDevice -DeviceId <id> (or disable it first if you want to preserve it for evidence).\n\n4) REMOVE any authentication methods added after the sign-in (Users > <user> > Authentication methods).\n\n5) PASSWORD: not technically exposed by this technique, but reset it as a precaution if there is ANY doubt (e.g. the lure also included a credential page, or AiTM indicators appear).\n\n6) BLOCK:\n   - Identity Protection > Risky users > 'Confirm user compromised'.\n   - Attacker IPs into a blocked Conditional Access named location; Meraki Layer 3 deny; Defender Indicators / CrowdStrike IOC management.\n   - Immediate control for the rest of the tenant: a Conditional Access policy using the 'Authentication flows' condition to BLOCK device code flow for all users except a defined exclusion group of people/devices who genuinely need it. Start it in report-only if you need to measure impact, but in an active campaign, enforce.\n\nRecord every action with a timestamp.",
+      "evidence": [
+        {
+          "id": "revoke",
+          "label": "Sign-in block / session revocation (times)",
+          "type": "textarea"
+        },
+        {
+          "id": "devices",
+          "label": "Attacker devices removed/disabled",
+          "type": "textarea"
+        },
+        {
+          "id": "methods",
+          "label": "Auth methods removed / password reset (if done)",
+          "type": "textarea"
+        },
+        {
+          "id": "blocks",
+          "label": "Confirm compromised, IP blocks, device-code CA policy status",
+          "type": "textarea"
+        }
+      ],
+      "next": "lure",
+      "playbook": "CONTAINMENT"
+    },
+    "lure": {
+      "type": "step",
+      "title": "Identify the lure",
+      "instructions": "Find how the code reached the user — this identifies the campaign and other targets.\n\nCOMMON LURES:\n- Microsoft Teams chat or call from an external account (often impersonating a colleague, partner, official, or IT) sending a 'meeting invite' with a code to 'join' — sent minutes before the device-code sign-in.\n- Email: 'secure document', 'encrypted message', 'verify your account', or a meeting invite with instructions to go to microsoft.com/devicelogin (or aka.ms/devicelogin) and enter a code.\n- Messaging apps (WhatsApp, Signal, LinkedIn) building rapport over days, then sending the code — these will not appear in corporate logs; rely on the user.\n- Lure web pages that auto-generate a fresh code, sometimes copy it to the clipboard and open the Microsoft page for the user.\n\nHOW TO LOOK:\n- Avanan: search the user's mail before the sign-in for 'devicelogin', 'device login', 'enter the code', 'aka.ms/devicelogin', or meeting invites from unfamiliar senders. Record sender, subject, all recipients.\n- Teams (Purview > Audit, Record type MicrosoftTeams, user + window): ChatCreated / MessageSent with external participants (ParticipantInfo HasForeignTenantUsers = true) shortly before the sign-in. Teams admin center > Users > <user> > Meetings & calls for external calls.\n- Umbrella: the Microsoft domains themselves are normal; but check the user's resolutions just before the sign-in for a lure page domain (auto-generating kits) or link redirectors. Enrich any candidate in VirusTotal / urlscan.io.\n- User interview (trusted channel): who sent the code, through what app, what pretext, and whether they have been talking to that person before. Ask for screenshots; ask them not to delete or reply to the conversation.",
+      "evidence": [
+        {
+          "id": "channel",
+          "label": "Lure channel & sender (email / Teams / messaging app / web)",
+          "type": "textarea"
+        },
+        {
+          "id": "details",
+          "label": "Lure content, pretext, any URLs / domains",
+          "type": "textarea"
+        },
+        {
+          "id": "recipients",
+          "label": "Other recipients / targets identified",
+          "type": "textarea"
+        }
+      ],
+      "next": "post-activity"
+    },
+    "post-activity": {
+      "type": "step",
+      "title": "Review what the attacker did with the tokens",
+      "instructions": "Review activity from the device-code sign-in until containment. Device code actors frequently focus on reading and exfiltrating mail via Microsoft Graph, then use the account to phish further.\n\n- Mail access: Purview audit MailItemsAccessed for the user, from attacker IPs (availability depends on audit licensing); 'SearchQueryInitiatedExchange' / search events if recorded. Known behavior: Graph keyword searches of the mailbox for terms like 'password', 'admin', 'credentials', 'secret', 'VPN', 'TeamViewer', 'AnyDesk', and topics relevant to the victim's role — then bulk download of matching mail.\n- Mail sent: Send / SendAs to internal users or external contacts — especially new device-code or document lures sent from the trusted account.\n- Mailbox changes: New-InboxRule / Set-InboxRule / forwarding (Get-InboxRule -Mailbox <user>).\n- Files: SharePoint/OneDrive FileAccessed / FileDownloaded / sharing links from attacker IPs.\n- Teams: messages sent to colleagues or external tenants from the user's account.\n- Identity persistence: devices registered (already removed in containment — confirm none were missed), security info registered, OAuth app consents ('Consent to application' — if present, run the Illicit OAuth App Consent playbook).\n- Graph activity logs (if exported to Log Analytics/Sentinel): MicrosoftGraphActivityLogs filtered by the user and attacker IPs shows the exact API calls — the most complete record of what was searched and downloaded.\n- One combined view (Defender, needs the Microsoft 365 connector in Defender for Cloud Apps):\n    CloudAppEvents\n    | where Timestamp > datetime(<device code sign-in>) and IPAddress in (\"<ip1>\",\"<ip2>\")\n    | summarize count(), make_set(ActionType) by AccountDisplayName, Application",
+      "evidence": [
+        {
+          "id": "mail",
+          "label": "Mail searched / read / downloaded",
+          "type": "textarea"
+        },
+        {
+          "id": "sent",
+          "label": "Mail / Teams messages sent from the account",
+          "type": "textarea"
+        },
+        {
+          "id": "files",
+          "label": "Files accessed / shared",
+          "type": "textarea"
+        },
+        {
+          "id": "persistence",
+          "label": "Persistence found (devices / methods / rules / OAuth)",
+          "type": "textarea"
+        }
+      ],
+      "next": "eradicate"
+    },
+    "eradicate": {
+      "type": "step",
+      "title": "Remove persistence and re-secure the account",
+      "instructions": "- Delete any malicious inbox rules and forwarding; recover mail that was moved/deleted.\n- Confirm ALL attacker-registered devices are removed and no new ones appeared after containment.\n- Remove OAuth grants created during the compromise (disable the app per the OAuth playbook).\n- Revoke sharing links the attacker created.\n- Revoke sessions one more time after cleanup.\n- Ensure the device-code-blocking Conditional Access policy covers this user (unless they are in a justified exclusion group).\n- Monitor the user's sign-ins for 48-72 hours, specifically for new device-code sign-ins and for non-interactive sign-ins from new infrastructure.",
+      "evidence": [
+        {
+          "id": "cleanup",
+          "label": "Rules / devices / grants / links removed",
+          "type": "textarea"
+        },
+        {
+          "id": "final",
+          "label": "Final revocation & CA coverage confirmed",
+          "type": "text"
+        },
+        {
+          "id": "monitor",
+          "label": "Monitoring plan (who / until when)",
+          "type": "text"
+        }
+      ],
+      "next": "scope"
+    },
+    "scope": {
+      "type": "step",
+      "title": "Scope the campaign",
+      "instructions": "- Tenant-wide device-code sign-ins (last 30-90 days): Entra Sign-in logs with Authentication protocol = Device code, all users. Review every user who is NOT on the known list of legitimate device-code users; each unexplained one needs this playbook.\n    Graph PowerShell: Get-MgBetaAuditLogSignIn -Filter \"authenticationProtocol eq 'deviceCode'\" -All | Group-Object UserPrincipalName | Select Count, Name\n- Same infrastructure: sign-ins from the attacker IPs across all users (Defender AADSignInEventsBeta where IPAddress in (...)).\n- Lure recipients: Avanan (same sender/subject/content) and Purview Teams audit (same external tenant/account contacting other users). Block the external Teams domain in Teams admin center > Users > External access.\n- Downstream victims: recipients of any phishing sent from the compromised account.\n- Data exposure summary: mailboxes/files accessed, sensitive content involved (for legal/privacy decisions).\n- Timeline: lure -> device-code sign-in -> token use -> attacker actions -> containment.",
+      "evidence": [
+        {
+          "id": "tenant",
+          "label": "Other unexplained device-code sign-ins (users)",
+          "type": "textarea"
+        },
+        {
+          "id": "infra",
+          "label": "Other users seen from attacker infrastructure",
+          "type": "textarea"
+        },
+        {
+          "id": "targets",
+          "label": "Lure recipients / downstream targets",
+          "type": "textarea"
+        },
+        {
+          "id": "timeline",
+          "label": "Timeline & data exposure",
+          "type": "textarea"
+        }
+      ],
+      "next": "impact?",
+      "playbook": "SCOPING"
+    },
+    "impact?": {
+      "type": "decision",
+      "title": "What was the impact?",
+      "instructions": "Any token use from attacker infrastructure that accessed data or took actions, a registered device, multiple victims, or a privileged/high-value user = escalate. A device-code grant revoked before any attacker token use, for one user, can be closed as contained.",
+      "options": [
+        {
+          "label": "Tokens used / data accessed / device registered / multiple users / privileged",
+          "next": "escalate",
+          "note": "Escalate to IR."
+        },
+        {
+          "label": "Revoked before any attacker use — single user",
+          "next": "close-contained",
+          "note": "Close with hardening."
+        }
+      ]
+    },
+    "escalate": {
+      "type": "terminal",
+      "title": "Escalate to incident response",
+      "instructions": "Device code phishing resulted in attacker token use, persistence, or affected multiple users.\n\n- Ensure the device-code sign-in, token-use analysis, containment (revocation and device removal), lure, attacker activity, and scope are recorded above.\n- Assign severity per your matrix — raise for executive/policy/admin targets, mail exfiltration, or internal spread. Given this technique's association with espionage-focused actors, consider whether the content accessed is sensitive to the business or to external parties.\n- Notify the on-call IR owner; involve legal/privacy for data exposure.\n- Hardening for post-incident review: enforce the Conditional Access block on device code flow (and on authentication transfer) with a tightly managed exclusion group; require compliant devices for access to sensitive apps; restrict external Teams access; user awareness that a legitimate meeting or document never requires entering a code at microsoft.com/devicelogin.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Device code phishing led to attacker token use; tokens revoked, devices removed, campaign scoped, escalated to IR."
+    },
+    "close-contained": {
+      "type": "terminal",
+      "title": "Close — device code grant revoked before use",
+      "instructions": "- Document the device-code sign-in, the lure, the evidence that no attacker token use occurred, and containment actions.\n- Confirm the device-code Conditional Access block is in place (or record the decision and owner if not).\n- Confirm lure blocking (Avanan sender, Teams external domain) and user awareness brief.\n- Confirm the monitoring window completed without recurrence.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Device code phishing contained before any attacker token use; controls applied, closed."
+    },
+    "benign-close": {
+      "type": "terminal",
+      "title": "Close — legitimate device code use",
+      "instructions": "- Document the user, app (e.g. Azure CLI), purpose, and how it was verified (same IP/managed device for token use, user confirmation via trusted channel).\n- Add the user/device to the managed exclusion group for the device-code Conditional Access policy if their work requires it — keep that group small and reviewed.\n- Propose tuning scoped to that user + app, not a blanket exclusion for device-code sign-ins.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Device code sign-in verified as legitimate tool use; documented and scoped tuning/exclusion proposed."
+    }
+  }
+}
