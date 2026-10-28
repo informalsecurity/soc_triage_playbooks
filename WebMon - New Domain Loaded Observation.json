@@ -1,0 +1,313 @@
+{
+  "id": "proc-webmon-new-domain",
+  "title": "webmon — New Domain Loaded Observation",
+  "version": "1.0",
+  "detectionType": "Website monitoring / webmon new registrable domain loaded by a monitored page (PagerDuty class new-loaded-host, newBaseDomain=true)",
+  "severityDefault": "medium",
+  "description": "webmon observed a monitored web page loading a host on a registrable domain never seen before for that site. This is the primary signal of website compromise: injected scripts commonly load attacker domains that serve ClickFix fake CAPTCHAs, fake browser updates, or malware downloads through a traffic distribution system. This procedure enriches the domain, traces which script loaded it, analyzes the content with cloaking in mind, rules benign site changes in or out with the owner, and — if malicious — contains and cleans the site, scopes exposure, and removes the auto-added host from the baseline so detection is restored.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "TOOL BACKGROUND — webmon:\n- A PowerShell script on a DigitalOcean droplet, run hourly by cron. For each monitored site it opens the page in headless Google Chrome for 60 seconds (desktop Windows user-agent, fresh profile, no cookies) and records every hostname the page contacts: scripts, iframes, XHR/fetch, websockets, and redirects. Chrome's own background traffic is filtered out.\n- Each run compares the observed hosts to a per-site baseline. Any host not in the baseline raises ONE PagerDuty alert per site per run, and the host is then AUTOMATICALLY ADDED to the baseline — the same host never alerts twice.\n- Purpose: detect website compromise. A compromised site typically gets a script injected that loads from a new attacker domain, serving ClickFix (fake CAPTCHA / 'press Win+R and paste'), fake browser updates, or RAT/infostealer downloads, often through a traffic distribution system (TDS).\n- Domains in alerts are defanged ([.] instead of .). Refang only when pasting into a lookup tool — never into a browser.\n- Severities are deliberately low while the tool is tuned (new domain = warning, new subdomain = info, site failure = warning). Do not read the PagerDuty severity as the real risk.\n\nWHERE TO LOOK (droplet, /opt/webmon/ — commands are PowerShell 7 / pwsh on the droplet):\n- state/baseline_<site>.json — every known host for the site with firstSeen timestamp and source (init / learn / alert), plus a manual 'wildcards' allow-list for that site.\n- config.json — monitored sites and the global 'ignore_patterns' list (syntax: '*.example.com', 'host.example.com', 're:<regex>').\n- webmon.log — per-run output: observed host counts, new hosts, errors.\n    # Last runs for this site\n    Select-String -Path /opt/webmon/webmon.log -Pattern '<site>' | Select-Object -Last 40\n    # A host's baseline entry (firstSeen / source)\n    Select-String -Path /opt/webmon/state/baseline_<site>.json -Pattern '<host-regex, e.g. buns\\.xyz>' -Context 2,4\n    # Current wildcards and global ignore patterns\n    (Get-Content /opt/webmon/state/baseline_<site>.json -Raw | ConvertFrom-Json).wildcards\n    (Get-Content /opt/webmon/config.json -Raw | ConvertFrom-Json).ignore_patterns\n\nSAFETY RULE: never browse an alerted domain — or the affected page — from a normal workstation. Use urlscan.io (unlisted/private scans), a sandbox, or an isolated VM.\n\nTHIS ALERT — New Domain Loaded Observation (highest priority of the webmon alerts):\nThe page loaded a host on a registrable domain NEVER seen before for that site. This is webmon's primary compromise signal.\n\nRecord from PagerDuty (title + custom_details):\n- site, and the exact monitored page/URL.\n- new_hosts[]: each host, its baseDomain, and newBaseDomain (true = new registrable domain). One alert can list SEVERAL hosts — triage each one. A single malicious host makes the whole alert malicious.\n- total_observed, baseline_file, checked_utc, dedup_key.\n\nCorrelate before you start:\n- The same malicious host often alerts on several monitored pages of the same site (e.g. deandorton[.]com and deandorton[.]com/baird-alliance). Search PagerDuty for other webmon alerts naming the same host or the same site in the last 24-48 hours, and handle them as ONE incident.\n- Check webmon.log for this site: when the new host first appeared, and whether other new hosts appeared in the same or adjacent runs (TDS chains often load 2-3 new domains together).\n\nIMPORTANT: because the host was auto-added to the baseline, webmon will NOT alert again while the injection stays live. Do not treat silence on later runs as evidence the site is clean.",
+      "evidence": [
+        {
+          "id": "site",
+          "label": "Site / monitored page(s) / checked_utc",
+          "type": "text"
+        },
+        {
+          "id": "hosts",
+          "label": "New host(s) with baseDomain / newBaseDomain",
+          "type": "textarea"
+        },
+        {
+          "id": "related",
+          "label": "Related webmon alerts (other pages / same host) & webmon.log context",
+          "type": "textarea"
+        }
+      ],
+      "next": "reputation"
+    },
+    "reputation": {
+      "type": "step",
+      "title": "Enrich each new domain (reputation and age)",
+      "instructions": "Build a profile of each new host before deciding anything. Refang only inside lookup tools.\n\n- Domain age and registration: WHOIS creation date (VirusTotal domain 'Details' tab, or a registrar/WHOIS lookup). A domain only days or a few weeks old is a major red flag. Note the registrar and privacy service.\n- TLD: inexpensive TLDs such as .xyz, .top, .shop, .click, .online, .site, .icu are higher risk (not proof on their own).\n- VirusTotal: detections, categories, community comments, and the Relations tab (resolutions, communicating/downloaded files, referring URLs from other compromised sites).\n- urlscan.io: search first — domain:<domain> and page.domain:<domain>. Prior scans of OTHER sites that loaded the same domain strongly suggest an injection campaign; screenshots may show a fake CAPTCHA or update page.\n- Passive DNS: VirusTotal resolutions, Umbrella Investigate (if licensed: first-seen, risk score, co-occurring domains, other domains on the same IP). Frequent IP changes and many unrelated domains on one IP are suspicious.\n- Hosting / ASN: ipinfo.io or Shodan (shodan.io/host/<IP>). Bulletproof or cheap VPS hosting is suspicious; a major CDN only means the attacker may be hiding behind it.\n- Known vendor? Is it a recognized ad-tech, analytics, tag manager, CDN, font, consent, chat, or accessibility vendor? Check the vendor's own documentation for the hostname — attackers deliberately choose names that look like analytics or CDN hosts (e.g. 'cdn-js', 'analytics-stat', 'jquery-cdn').\n\nSPECIAL CASE — legitimate-looking blockchain hosts: a new host that is a public blockchain RPC endpoint (for example a Binance Smart Chain / BNB Chain or Polygon RPC node) on a normal marketing website is a known indicator of 'EtherHiding'-style injections (e.g. the ClearFake family), where the injected script fetches its next stage from a smart contract. The domain itself is reputable — the context is what is malicious.\n\nRecord a one-line verdict per host: known vendor / unknown-suspicious / known-malicious.",
+      "evidence": [
+        {
+          "id": "whois",
+          "label": "WHOIS creation date, registrar, TLD (per host)",
+          "type": "textarea"
+        },
+        {
+          "id": "intel",
+          "label": "VirusTotal / urlscan / passive DNS / ASN findings",
+          "type": "textarea"
+        },
+        {
+          "id": "vendor",
+          "label": "Known vendor? Per-host preliminary verdict",
+          "type": "textarea"
+        }
+      ],
+      "next": "loader-trace"
+    },
+    "loader-trace": {
+      "type": "step",
+      "title": "Find what loaded the domain (without visiting it)",
+      "instructions": "Identify the script or tag on the monitored page that caused the new host to load. This tells you whether it is an injection and where to remove it.\n\nHOW TO LOOK — urlscan.io (preferred):\n- Submit the MONITORED PAGE (not the alerted domain) with visibility set to Unlisted or Private.\n- Results > HTTP tab: find requests to the new host; open each to see its initiator/referrer and the parent script. Results > Links/DOM: look at script tags. The 'Indicators' and 'Behaviour' sections can show redirects and downloads.\n\nHOW TO LOOK — sandboxed browser (isolated VM / disposable browser):\n- Open DevTools before loading the page; Network tab with 'Preserve log' on. Load the page and wait at least 60 seconds (webmon watches 60 s; some injections delay).\n- Filter the Network tab by the new host. The 'Initiator' column shows which script (and line) requested it — follow the chain upward until you reach a script that belongs to the site or to an injected tag.\n\nWHAT AN INJECTION LOOKS LIKE in the page source (View Source and the Elements tab — both, since injected code can be added by script after load):\n- A <script src> pointing to a random-looking or unrelated domain, often placed in the header or footer.\n- Inline obfuscated JavaScript: eval(, atob(, long base64 strings, String.fromCharCode(, long hex/unicode escape strings (\\x68\\x74...), document.write of a script tag, or code that builds a URL from character arrays.\n- A script added to a legitimate file (e.g. appended to the end of a theme or jQuery file), or inside Google Tag Manager as a 'Custom HTML' tag.\n- Injected code that checks referrer, cookies, localStorage, or user-agent before acting — a cloaking gate.\n\nRecord the parent script URL/file, the injected snippet (save a copy as text — do not execute it), and where in the page it sits.",
+      "evidence": [
+        {
+          "id": "scan",
+          "label": "urlscan / sandbox reference(s) (scan IDs, VM used)",
+          "type": "textarea"
+        },
+        {
+          "id": "initiator",
+          "label": "Initiator chain: page -> parent script -> new host",
+          "type": "textarea"
+        },
+        {
+          "id": "snippet",
+          "label": "Injected snippet / location in page or GTM",
+          "type": "textarea"
+        }
+      ],
+      "next": "content-analysis"
+    },
+    "content-analysis": {
+      "type": "step",
+      "title": "Analyze what the domain serves (with cloaking in mind)",
+      "instructions": "Determine whether the content from the new host is malicious. Injected scripts are commonly cloaked: they show the malicious payload only to certain visitors.\n\nCLICKFIX / FAKE-UPDATE INDICATORS in the loaded content or screenshots:\n- A fake CAPTCHA or 'Verify you are human' overlay (often styled like Cloudflare or reCAPTCHA).\n- JavaScript calling navigator.clipboard.writeText (or document.execCommand('copy')) with text containing powershell, mshta, cmd, msiexec, curl, iex/irm, or base64.\n- On-page instructions mentioning Win+R, Win+X, Ctrl+V, 'Run dialog', 'Terminal', or pasting into File Explorer's address bar.\n- Fake Chrome/Edge/Firefox 'update required' pages, or 'font missing' prompts.\n- Forced or prompted downloads of .zip, .msi, .js, .hta, .vbs, .iso, .exe.\n- Redirect chains through intermediate domains (a TDS) that end on any of the above.\n\nCLOAKING — a clean re-check does NOT prove benign. Injections often show the payload only to:\n- first-time visitors (no cookie/localStorage marker),\n- Windows desktop user-agents,\n- visitors arriving from a search engine (Google referrer),\n- non-datacenter IP addresses (residential).\nBefore concluding 'nothing malicious', re-test with: a residential or VPN egress (urlscan lets you pick a scan country; a sandbox VM on a consumer VPN), a Google referrer (urlscan allows setting a custom referer), a Windows desktop user-agent, and a completely fresh profile. Test from a different egress each time, since many kits show the lure only once per IP.\n\nIf you retrieve a payload, command, or file: decode the command (CyberChef) and enrich the hashes/URLs in VirusTotal, URLhaus/ThreatFox (abuse.ch), and MalwareBazaar. If ClickFix commands were served, extract every URL/IP for scoping.",
+      "evidence": [
+        {
+          "id": "indicators",
+          "label": "Malicious indicators observed (fake CAPTCHA / clipboard / fake update / downloads)",
+          "type": "textarea"
+        },
+        {
+          "id": "cloak",
+          "label": "Cloaking re-tests performed (egress / referrer / UA / profile) and results",
+          "type": "textarea"
+        },
+        {
+          "id": "payload",
+          "label": "Payload commands / files / URLs and their enrichment",
+          "type": "textarea"
+        }
+      ],
+      "next": "change-check"
+    },
+    "change-check": {
+      "type": "step",
+      "title": "Rule benign explanations in or out",
+      "instructions": "Many new domains are legitimate site changes. Confirm with a human owner — do not close as benign based on reputation alone.\n\nCOMMON BENIGN CAUSES:\n- An approved deploy or content update; a new or updated plugin/theme.\n- A new marketing tag (ad pixel, analytics, heatmap, A/B testing tool).\n- Google Tag Manager container changes.\n- New chat, accessibility, cookie-consent, review, or booking widgets.\n\nCONFIRM:\n- Ask the site owner / web team / marketing: was anything added or changed around checked_utc? Get the change ticket or the name of the person who made it.\n- Google Tag Manager: in the container, review Versions (who published which version and when) and the tags added. Confirm the publishing account is known — an unknown user or an unexpected 'Custom HTML' tag means the GTM account itself may be compromised.\n- Does the vendor's documentation list this exact hostname? Does the domain owner (WHOIS / certificate) match the vendor?\n\nA benign explanation must account for EVERY new host in the alert. If even one host is unexplained, keep it open.",
+      "evidence": [
+        {
+          "id": "owner",
+          "label": "Owner/marketing confirmation (who, when, change ref)",
+          "type": "textarea"
+        },
+        {
+          "id": "gtm",
+          "label": "GTM version history & publisher check",
+          "type": "textarea"
+        },
+        {
+          "id": "explained",
+          "label": "Is every new host explained? (per host)",
+          "type": "textarea"
+        }
+      ],
+      "next": "verdict?"
+    },
+    "verdict?": {
+      "type": "decision",
+      "title": "What is the verdict?",
+      "instructions": "- Malicious: any malicious indicator from content analysis, a known-malicious or freshly registered unknown domain loaded by an injected/obfuscated script, a GTM tag published by an unknown account, or prior urlscan evidence of the same domain on other compromised sites.\n- Benign: every host explained by an owner-confirmed change and/or a verified vendor, with no malicious indicators.\n- Inconclusive: unexplained but no malicious content observed (possibly cloaked).",
+      "options": [
+        {
+          "label": "Malicious (injection / ClickFix / fake update / TDS)",
+          "next": "contain-site",
+          "note": "Escalate and contain the site."
+        },
+        {
+          "label": "Inconclusive — unexplained, no payload seen",
+          "next": "cms-review",
+          "note": "Look for compromise evidence directly."
+        },
+        {
+          "label": "Benign — owner-confirmed change / verified vendor",
+          "next": "benign-close",
+          "note": "Close; tune only if needed."
+        }
+      ]
+    },
+    "cms-review": {
+      "type": "step",
+      "title": "Inconclusive — check the CMS/hosting for compromise",
+      "instructions": "When the content looks clean (or is cloaked) and no one can explain the domain, look for compromise on the site itself. Coordinate with the site owner/web host for access.\n\n- Repeat the cloaked re-tests from the content step with different egress points over the next few runs.\n- Perform the CMS/hosting checks listed in the eradication step (unknown admins, modified files, wp_options/widget changes, .htaccess, plugins, control panel/FTP logs) — read-only for now.\n- Search the site's files and database for the new domain name and for the injected snippet found in the loader trace.\n\nDecide: compromise evidence found -> malicious. Clean and the owner now explains the change -> benign. Still unexplained third-party code on the site -> treat as malicious: an unknown script running on the site is a supply-chain risk even if today's payload is not visible.",
+      "evidence": [
+        {
+          "id": "retests",
+          "label": "Additional re-tests and results",
+          "type": "textarea"
+        },
+        {
+          "id": "cms",
+          "label": "CMS / hosting findings",
+          "type": "textarea"
+        },
+        {
+          "id": "conclusion",
+          "label": "Conclusion",
+          "type": "text"
+        }
+      ],
+      "next": "cms-verdict?"
+    },
+    "cms-verdict?": {
+      "type": "decision",
+      "title": "What did the CMS review conclude?",
+      "instructions": "Compromise evidence or still-unexplained third-party code means treat as malicious. Only an owner-confirmed explanation with a clean CMS review allows a benign close.",
+      "options": [
+        {
+          "label": "Compromise found, or still unexplained",
+          "next": "contain-site",
+          "note": "Treat as malicious."
+        },
+        {
+          "label": "Clean and now explained by the owner",
+          "next": "benign-close",
+          "note": "Benign."
+        }
+      ]
+    },
+    "contain-site": {
+      "type": "step",
+      "title": "Escalate and contain the site",
+      "instructions": "Every visitor to the page is at risk while the injection is live. Escalate to IR now and contain in parallel.\n\n- Notify the IR on-call and the site owner. Correlate all webmon alerts for this site/host into this one incident.\n- PRESERVE EVIDENCE before cleaning: copies of injected/modified files, a database export (or at least the affected tables), web server/access logs, CMS/plugin logs, hosting control-panel and FTP/SFTP logs, GTM version export, and your urlscan/sandbox results.\n- Put the site into maintenance mode or take it offline (or remove the injected tag immediately if the owner cannot take the site down — and record that choice).\n- Block the malicious domain(s) and any TDS/payload domains for your own users: Umbrella block destination list; Meraki Layer 3 deny / content-filter for IPs; CrowdStrike IOC management and Defender Indicators for domains, IPs, and payload hashes.\n- If the site's customers are the main victims, start the conversation with the owner/legal/communications about visitor notification.",
+      "evidence": [
+        {
+          "id": "ir",
+          "label": "IR notified / incident ID / site owner contact",
+          "type": "text"
+        },
+        {
+          "id": "preserve",
+          "label": "Evidence preserved (files / DB / logs / GTM export)",
+          "type": "textarea"
+        },
+        {
+          "id": "site",
+          "label": "Site status (maintenance / offline / tag removed) and time",
+          "type": "text"
+        },
+        {
+          "id": "blocks",
+          "label": "Blocks applied (Umbrella / Meraki / CrowdStrike / Defender)",
+          "type": "textarea"
+        }
+      ],
+      "next": "eradicate",
+      "playbook": "CONTAINMENT"
+    },
+    "eradicate": {
+      "type": "step",
+      "title": "Find the root cause and remove the injection",
+      "instructions": "Removing the visible script is not enough — find how the attacker got in, or they will re-inject.\n\nCMS COMPROMISE CHECKS (WordPress is the most common; adapt for other CMSs):\n- Users: new or unknown administrator accounts; recently changed admin emails/passwords. (WP-CLI on the web server: wp user list --role=administrator)\n- Core/plugin/theme integrity: recently modified files (sort by modified time), files that differ from the official versions (WP-CLI: wp core verify-checksums; wp plugin verify-checksums --all), PHP files in uploads directories, unknown or nulled plugins, must-use plugins (wp-content/mu-plugins).\n- Database: wp_options entries (e.g. siteurl/home, widget and theme options) and wp_posts containing <script> tags or the malicious domain; injected 'header/footer scripts' plugin settings.\n- Web server config: .htaccess (or nginx config) redirects or conditional rewrites by referrer/user-agent.\n- Hosting: control-panel and FTP/SFTP access logs for unknown IPs; SSH keys; cron jobs added on the web server.\n- Tag managers: GTM users/permissions and unknown published versions.\n\nCLEAN UP:\n- Remove the injection from every location found (files, database, GTM). Restore modified core/plugin/theme files from known-good sources rather than hand-editing.\n- Remove unknown admin users, plugins, and backdoors.\n- Rotate ALL credentials: CMS admins, hosting/control panel, FTP/SFTP, database, API keys/salts in config files, GTM account access.\n- Patch the CMS, plugins, and themes; remove unused plugins.\n- Re-scan the page with urlscan (unlisted) using the cloaking re-test variations to confirm the malicious host no longer loads.",
+      "evidence": [
+        {
+          "id": "rootcause",
+          "label": "Root cause / entry point",
+          "type": "textarea"
+        },
+        {
+          "id": "removed",
+          "label": "Injection locations removed & backdoors/users removed",
+          "type": "textarea"
+        },
+        {
+          "id": "rotated",
+          "label": "Credentials rotated & patching done",
+          "type": "textarea"
+        },
+        {
+          "id": "verify",
+          "label": "Post-cleanup verification scans",
+          "type": "textarea"
+        }
+      ],
+      "next": "scope"
+    },
+    "scope": {
+      "type": "step",
+      "title": "Scope who was exposed",
+      "instructions": "Identify internal users (and, with the owner, customers) who visited the compromised page or contacted the malicious domains — then check whether any of them ran a ClickFix command or a fake-update download.\n\n- Umbrella: Reporting > Activity Search for each malicious domain (and TDS/payload domains) across all identities, from the earliest likely injection time (use webmon firstSeen and urlscan history) to now.\n- Meraki: for IP-only payload hosts, check Security center events and client traffic (or Meraki flow logs in your SIEM).\n- Hunt ClickFix execution on endpoints that contacted the domains (full detail in the ClickFix playbook):\n    Defender:\n    DeviceProcessEvents\n    | where Timestamp > ago(14d) and InitiatingProcessFileName =~ \"explorer.exe\"\n    | where FileName in~ (\"powershell.exe\",\"mshta.exe\",\"cmd.exe\",\"msiexec.exe\",\"curl.exe\")\n    | where ProcessCommandLine matches regex @\"(?i)(https?://|iex|irm|iwr|-enc|captcha|robot|verif)\"\n    DeviceRegistryEvents\n    | where Timestamp > ago(14d) and RegistryKey has @\"\\Explorer\\RunMRU\"\n    | project Timestamp, DeviceName, InitiatingProcessAccountName, RegistryValueData\n    CrowdStrike:\n    #event_simpleName=ProcessRollup2 ParentBaseFileName=explorer.exe FileName=/^(powershell|mshta|cmd|msiexec|curl)\\.exe$/i CommandLine=/(https?:|iex|irm|iwr|-enc|captcha|robot|verif)/i\n- Downloads from the domains: Defender DeviceFileEvents / DeviceNetworkEvents with RemoteUrl matching the domains; CrowdStrike DnsRequest for the domains grouped by ComputerName.\n- Any host that executed a payload goes into the ClickFix / malware playbooks as its own case.\n- Customers/visitors: with the owner, estimate exposure from web analytics (visitors during the injection window) for notification decisions.",
+      "evidence": [
+        {
+          "id": "umbrella",
+          "label": "Internal identities that contacted the domains",
+          "type": "textarea"
+        },
+        {
+          "id": "endpoint",
+          "label": "ClickFix / download hunt results (hosts)",
+          "type": "textarea"
+        },
+        {
+          "id": "external",
+          "label": "Customer/visitor exposure estimate & notification decision",
+          "type": "textarea"
+        },
+        {
+          "id": "window",
+          "label": "Injection window (first seen -> removed)",
+          "type": "text"
+        }
+      ],
+      "next": "baseline-fix",
+      "playbook": "SCOPING"
+    },
+    "baseline-fix": {
+      "type": "step",
+      "title": "CRITICAL — restore detection (remove the host from the baseline)",
+      "instructions": "When the alert fired, webmon automatically added the malicious host to baseline_<site>.json. If it stays there, a RE-INJECTION of the same domain will NOT alert. Remove it after the injection has been cleaned up.\n\nOn the droplet (pwsh). Edit between runs — check webmon.log for the last run time so the hourly cron job does not overwrite your change mid-run:\n    $f = '/opt/webmon/state/baseline_<site>.json'\n    Copy-Item $f \"$f.bak-$(Get-Date -Format yyyyMMddHHmmss)\"\n    Select-String -Path $f -Pattern '<host-regex>' -Context 2,4      # find the entry (source should be 'alert')\n    # Remove the host's entry with an editor (e.g. nano $f), keeping the JSON structure intact, then validate:\n    $null = Get-Content $f -Raw | ConvertFrom-Json                    # throws if the JSON is broken\n    Select-String -Path $f -Pattern '<host-regex>'                     # should return nothing\n\n- Remove EVERY malicious host from this incident (including TDS/payload hosts), from EVERY affected site's baseline (if the same host hit multiple monitored pages, each has its own baseline file).\n- Confirm no wildcard in that baseline or ignore_pattern in config.json covers the malicious host (a broad wildcard would silence it just the same).\n- After the next hourly run, check webmon.log: if the malicious host alerts again, the injection is still present or was re-injected — reopen containment.",
+      "evidence": [
+        {
+          "id": "removed",
+          "label": "Hosts removed from which baseline files (with backup names)",
+          "type": "textarea"
+        },
+        {
+          "id": "wildcards",
+          "label": "Wildcards / ignore_patterns checked",
+          "type": "text"
+        },
+        {
+          "id": "nextrun",
+          "label": "Next-run result after removal",
+          "type": "text"
+        }
+      ],
+      "next": "escalate"
+    },
+    "escalate": {
+      "type": "terminal",
+      "title": "Escalated — website compromise",
+      "instructions": "The monitored site was serving malicious third-party content and is under IR.\n\n- Ensure the ticket records: all related webmon alerts, each host's enrichment, the initiator chain and injected snippet, malicious indicators, root cause, cleanup and credential rotation, scope results, and the baseline cleanup.\n- Confirm the IR owner has the preserved evidence and the site owner has confirmed remediation.\n- Record the verdict, the injection source, and any tuning change in the ticket.\n- Lessons for review: how the attacker got in (vulnerable plugin, stolen credentials, GTM access), and whether MFA, plugin hygiene, file-integrity monitoring, or a Content Security Policy on the site would have prevented or limited it.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Website served an injected malicious domain; site contained and cleaned, exposure scoped, baseline restored, escalated to IR."
+    },
+    "benign-close": {
+      "type": "terminal",
+      "title": "Close — benign new domain",
+      "instructions": "Every new host is explained by an owner-confirmed change or a verified legitimate vendor, and no malicious indicators were found.\n\n- Record the verdict, the confirming person/change reference, and the vendor identification for each host.\n- No baseline action is normally needed — the host was already auto-added.\n- If the vendor rotates hostnames and will keep alerting, add a NARROW wildcard to that site's baseline 'wildcards' list (e.g. '*.vendorcdn.com'), not a global ignore pattern. NEVER wildcard shared or free hosting platforms where anyone can create a subdomain: pages.dev, workers.dev, *.core.windows.net, github.io, vercel.app, netlify.app, r2.dev, trycloudflare.com, firebaseapp.com, herokuapp.com, and similar.\n- Record any tuning change (wildcard added / ignore pattern) in the ticket.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "New domain verified as a legitimate, owner-confirmed site change or vendor; closed with any narrow tuning recorded."
+    }
+  }
+}
