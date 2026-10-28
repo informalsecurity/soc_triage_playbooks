@@ -1,0 +1,144 @@
+{
+  "id": "proc-webmon-new-subdomain",
+  "title": "webmon — New Subdomain Loaded Observation",
+  "version": "1.0",
+  "detectionType": "Website monitoring / webmon new hostname under a known base domain (PagerDuty class new-loaded-host, newBaseDomain=false)",
+  "severityDefault": "low",
+  "description": "webmon observed a monitored page loading a new hostname under a registrable domain already in that site's baseline. This is usually CDN or ad-tech hostname rotation, but it becomes a new-domain risk when the parent is a shared hosting platform where anyone can create subdomains, when the parent itself entered the baseline through an unresolved alert, or when the subdomain looks suspicious. This procedure checks the parent and the subdomain, closes or tunes ordinary rotation, and reclassifies risky cases to new-domain handling.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "TOOL BACKGROUND — webmon:\n- A PowerShell script on a DigitalOcean droplet, run hourly by cron. For each monitored site it opens the page in headless Google Chrome for 60 seconds (desktop Windows user-agent, fresh profile, no cookies) and records every hostname the page contacts: scripts, iframes, XHR/fetch, websockets, and redirects. Chrome's own background traffic is filtered out.\n- Each run compares the observed hosts to a per-site baseline. Any host not in the baseline raises ONE PagerDuty alert per site per run, and the host is then AUTOMATICALLY ADDED to the baseline — the same host never alerts twice.\n- Purpose: detect website compromise. A compromised site typically gets a script injected that loads from a new attacker domain, serving ClickFix (fake CAPTCHA / 'press Win+R and paste'), fake browser updates, or RAT/infostealer downloads, often through a traffic distribution system (TDS).\n- Domains in alerts are defanged ([.] instead of .). Refang only when pasting into a lookup tool — never into a browser.\n- Severities are deliberately low while the tool is tuned (new domain = warning, new subdomain = info, site failure = warning). Do not read the PagerDuty severity as the real risk.\n\nWHERE TO LOOK (droplet, /opt/webmon/ — commands are PowerShell 7 / pwsh on the droplet):\n- state/baseline_<site>.json — every known host for the site with firstSeen timestamp and source (init / learn / alert), plus a manual 'wildcards' allow-list for that site.\n- config.json — monitored sites and the global 'ignore_patterns' list (syntax: '*.example.com', 'host.example.com', 're:<regex>').\n- webmon.log — per-run output: observed host counts, new hosts, errors.\n    # Last runs for this site\n    Select-String -Path /opt/webmon/webmon.log -Pattern '<site>' | Select-Object -Last 40\n    # A host's baseline entry (firstSeen / source)\n    Select-String -Path /opt/webmon/state/baseline_<site>.json -Pattern '<host-regex, e.g. buns\\.xyz>' -Context 2,4\n    # Current wildcards and global ignore patterns\n    (Get-Content /opt/webmon/state/baseline_<site>.json -Raw | ConvertFrom-Json).wildcards\n    (Get-Content /opt/webmon/config.json -Raw | ConvertFrom-Json).ignore_patterns\n\nSAFETY RULE: never browse an alerted domain — or the affected page — from a normal workstation. Use urlscan.io (unlisted/private scans), a sandbox, or an isolated VM.\n\nTHIS ALERT — New Subdomain Loaded Observation (usually benign):\nThe page loaded a NEW hostname under a registrable domain that is ALREADY in this site's baseline (newBaseDomain=false). Most often this is CDN or ad-tech hostname rotation. The job here is to quickly confirm that, and catch the cases that are really a new-domain risk in disguise.\n\nRecord from PagerDuty: site and page, each new host and its baseDomain, total_observed, baseline_file, checked_utc. One alert can list several hosts — check each. If any host in the alert has newBaseDomain=true, also run the New Domain Loaded playbook.\nCorrelate: other webmon alerts for the same site or the same parent domain in the last 24-48 hours.",
+      "evidence": [
+        {
+          "id": "site",
+          "label": "Site / page / checked_utc",
+          "type": "text"
+        },
+        {
+          "id": "hosts",
+          "label": "New host(s) and parent baseDomain",
+          "type": "textarea"
+        },
+        {
+          "id": "related",
+          "label": "Related alerts",
+          "type": "text"
+        }
+      ],
+      "next": "parent-check"
+    },
+    "parent-check": {
+      "type": "step",
+      "title": "Check the parent domain",
+      "instructions": "The subdomain is only as trustworthy as its parent — and only if nobody else can create subdomains under it.\n\n1) SHARED / FREE HOSTING PLATFORM? If the parent domain is a platform where anyone can create a subdomain, a 'new subdomain' is effectively a brand-new, possibly attacker-controlled site. Examples: pages.dev, workers.dev, blob.core.windows.net (and other *.core.windows.net), github.io, vercel.app, netlify.app, firebaseapp.com / web.app, herokuapp.com, r2.dev, trycloudflare.com, glitch.me, onrender.com, azurewebsites.net, s3.amazonaws.com / cloudfront.net, appspot.com. -> Handle as a NEW DOMAIN.\n\n2) HOW DID THE PARENT GET INTO THE BASELINE? Look at the parent's entries in the baseline:\n    Select-String -Path /opt/webmon/state/baseline_<site>.json -Pattern '<parent-regex, e.g. jsdelivr\\.net>' -Context 2,4\n- source 'init' or 'learn' with an old firstSeen: established, expected.\n- source 'alert': the parent itself entered the baseline through an earlier alert. Find that earlier ticket and confirm it was triaged as benign. If it was malicious and never removed from the baseline (the post-remediation step was missed), new attacker subdomains under that domain will only ever show up as 'new subdomain' alerts. -> Handle as a NEW DOMAIN.\n- Also check whether a wildcard or a global ignore_pattern already covers the parent (and why it did not cover this host).\n\n3) IS THE PARENT A LEGITIMATE, EXPECTED VENDOR for this site (CDN, analytics, ads, fonts, consent, chat)? Confirm via the vendor's documentation and VirusTotal/urlscan reputation.",
+      "evidence": [
+        {
+          "id": "platform",
+          "label": "Shared/free hosting platform? (yes/no)",
+          "type": "text"
+        },
+        {
+          "id": "baseline",
+          "label": "Parent baseline entries (source / firstSeen) & prior alert ticket",
+          "type": "textarea"
+        },
+        {
+          "id": "vendor",
+          "label": "Parent vendor identification & reputation",
+          "type": "textarea"
+        }
+      ],
+      "next": "subdomain-check"
+    },
+    "subdomain-check": {
+      "type": "step",
+      "title": "Check the subdomain itself",
+      "instructions": "- Name pattern: does it look like the vendor's normal rotation (e.g. numbered edge nodes, region codes, the same naming style as existing baseline entries)? Or suspicious: random strings, words like 'update', 'verify', 'captcha', 'secure', 'login', 'download', or look-alikes of library CDNs ('cdn-js', 'jquery-cdn', 'cdnjs-cloud')?\n- Compare against sibling subdomains already in the baseline for this parent — a new name in the same pattern is normal.\n- Reputation: VirusTotal and urlscan.io search for the exact hostname; passive DNS — does it resolve to the same infrastructure/ASN as the vendor's other hostnames?\n- If anything looks off, run an unlisted urlscan of the monitored page and check which script requested the subdomain (HTTP tab initiator). A legitimate vendor host should be requested by that vendor's own script.",
+      "evidence": [
+        {
+          "id": "pattern",
+          "label": "Naming pattern vs. existing siblings",
+          "type": "textarea"
+        },
+        {
+          "id": "rep",
+          "label": "Reputation / infrastructure match",
+          "type": "textarea"
+        },
+        {
+          "id": "initiator",
+          "label": "Initiator check (if performed)",
+          "type": "text"
+        }
+      ],
+      "next": "verdict?"
+    },
+    "verdict?": {
+      "type": "decision",
+      "title": "Is this ordinary vendor rotation?",
+      "instructions": "Escalate to new-domain handling if the parent is a shared/free hosting platform, the parent entered the baseline via an alert that was not clearly cleared as benign, the subdomain name is suspicious, the reputation is bad, or the initiator is not the vendor's own script. Otherwise it is rotation.",
+      "options": [
+        {
+          "label": "Shared platform / suspicious name / bad reputation / questionable parent",
+          "next": "escalate-new-domain",
+          "note": "Treat as a New Domain alert."
+        },
+        {
+          "label": "Normal rotation — one-off",
+          "next": "benign-close",
+          "note": "Close."
+        },
+        {
+          "label": "Normal rotation — recurring for this vendor",
+          "next": "tune",
+          "note": "Add a narrow wildcard."
+        }
+      ]
+    },
+    "tune": {
+      "type": "step",
+      "title": "Add a narrow wildcard for the rotating vendor",
+      "instructions": "Only when the same legitimate vendor keeps rotating hostnames and generating info alerts.\n\n- Add the narrowest wildcard that covers the rotation to THAT SITE'S baseline 'wildcards' list (not the global ignore_patterns) — e.g. '*.edge.vendorcdn.com' rather than '*.vendorcdn.com' if the rotation is confined to one label.\n- NEVER wildcard a shared/free hosting platform (pages.dev, workers.dev, *.core.windows.net, github.io, vercel.app, netlify.app, r2.dev, trycloudflare.com, firebaseapp.com, herokuapp.com, etc.).\n- On the droplet (pwsh), between runs:\n    $f = '/opt/webmon/state/baseline_<site>.json'\n    Copy-Item $f \"$f.bak-$(Get-Date -Format yyyyMMddHHmmss)\"\n    # Add the pattern to the \"wildcards\" array with an editor (e.g. nano $f), then validate:\n    (Get-Content $f -Raw | ConvertFrom-Json).wildcards\n- Check the next run in webmon.log to confirm the JSON still loads and the vendor's hosts no longer alert.",
+      "evidence": [
+        {
+          "id": "wildcard",
+          "label": "Wildcard added (exact pattern) and file/backup",
+          "type": "text"
+        },
+        {
+          "id": "justification",
+          "label": "Why this scope is the narrowest that works",
+          "type": "textarea"
+        }
+      ],
+      "next": "close-tuned"
+    },
+    "escalate-new-domain": {
+      "type": "terminal",
+      "title": "Reclassify — handle with the New Domain Loaded playbook",
+      "instructions": "The 'new subdomain' is effectively a new, potentially attacker-controlled host.\n\n- Record why it was reclassified (shared platform / suspicious name / bad reputation / questionable parent baseline entry).\n- Start the 'webmon — New Domain Loaded Observation' playbook for this host, linking this alert.\n- If the parent domain turned out to be a previously malicious host left in the baseline, also remove it (see the New Domain playbook's baseline step) and note the missed cleanup.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "New subdomain reclassified as new-domain risk (shared platform / suspicious / questionable parent); handed to New Domain playbook."
+    },
+    "benign-close": {
+      "type": "terminal",
+      "title": "Close — normal vendor rotation",
+      "instructions": "- Record the verdict and the evidence (legitimate parent with init/learn history, naming pattern matches siblings, clean reputation).\n- No baseline action needed — the host was auto-added.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "New subdomain under an established, legitimate vendor domain; normal rotation, closed."
+    },
+    "close-tuned": {
+      "type": "terminal",
+      "title": "Close — vendor rotation, wildcard added",
+      "instructions": "- Record the verdict, the exact wildcard added, the baseline file, and the backup file name.\n- Note the next-run confirmation.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Recurring legitimate vendor rotation; narrow per-site wildcard added and closed."
+    }
+  }
+}
