@@ -1,0 +1,160 @@
+{
+  "id": "proc-webmon-site-load-failure",
+  "title": "webmon — Site Load Failure",
+  "version": "1.0",
+  "detectionType": "Website monitoring / webmon consecutive load failures — monitoring blind spot (PagerDuty class site-load-failure)",
+  "severityDefault": "medium",
+  "description": "webmon failed to load a monitored page correctly three runs in a row, so the site is currently unmonitored; the alert auto-resolves when the site loads again. The cause is usually operational (site outage, WAF/bot protection blocking the droplet, or a problem with Chrome or the droplet itself), but unexplained DNS, certificate, or redirect changes can indicate a domain hijack or compromise. This procedure reads last_error to separate website-side from monitoring-host causes, checks DNS, TLS, redirects and droplet health, escalates suspicious changes, and closes only when the alert has resolved and the cause is understood.",
+  "startNode": "intake",
+  "nodes": {
+    "intake": {
+      "type": "step",
+      "title": "Intake and capture core facts",
+      "instructions": "TOOL BACKGROUND — webmon:\n- A PowerShell script on a DigitalOcean droplet, run hourly by cron. For each monitored site it opens the page in headless Google Chrome for 60 seconds (desktop Windows user-agent, fresh profile, no cookies) and records every hostname the page contacts: scripts, iframes, XHR/fetch, websockets, and redirects. Chrome's own background traffic is filtered out.\n- Each run compares the observed hosts to a per-site baseline. Any host not in the baseline raises ONE PagerDuty alert per site per run, and the host is then AUTOMATICALLY ADDED to the baseline — the same host never alerts twice.\n- Purpose: detect website compromise. A compromised site typically gets a script injected that loads from a new attacker domain, serving ClickFix (fake CAPTCHA / 'press Win+R and paste'), fake browser updates, or RAT/infostealer downloads, often through a traffic distribution system (TDS).\n- Domains in alerts are defanged ([.] instead of .). Refang only when pasting into a lookup tool — never into a browser.\n- Severities are deliberately low while the tool is tuned (new domain = warning, new subdomain = info, site failure = warning). Do not read the PagerDuty severity as the real risk.\n\nWHERE TO LOOK (droplet, /opt/webmon/ — commands are PowerShell 7 / pwsh on the droplet):\n- state/baseline_<site>.json — every known host for the site with firstSeen timestamp and source (init / learn / alert), plus a manual 'wildcards' allow-list for that site.\n- config.json — monitored sites and the global 'ignore_patterns' list (syntax: '*.example.com', 'host.example.com', 're:<regex>').\n- webmon.log — per-run output: observed host counts, new hosts, errors.\n    # Last runs for this site\n    Select-String -Path /opt/webmon/webmon.log -Pattern '<site>' | Select-Object -Last 40\n    # A host's baseline entry (firstSeen / source)\n    Select-String -Path /opt/webmon/state/baseline_<site>.json -Pattern '<host-regex, e.g. buns\\.xyz>' -Context 2,4\n    # Current wildcards and global ignore patterns\n    (Get-Content /opt/webmon/state/baseline_<site>.json -Raw | ConvertFrom-Json).wildcards\n    (Get-Content /opt/webmon/config.json -Raw | ConvertFrom-Json).ignore_patterns\n\nSAFETY RULE: never browse an alerted domain — or the affected page — from a normal workstation. Use urlscan.io (unlisted/private scans), a sandbox, or an isolated VM.\n\nTHIS ALERT — Site Load Failure (monitoring blind spot):\nThe page failed to load correctly 3 runs in a row, so webmon is currently NOT monitoring this site. This is not a compromise alert by itself — but some causes (DNS changes, unexpected redirects) can be. It AUTO-RESOLVES when the site loads successfully again.\n\nRecord from PagerDuty: site, last_error (copy verbatim), first_failure_utc, dedup_key (webmon-health:<site_key>).\n\nCheck scope right away:\n- Are OTHER sites also failing? Several sites failing at the same time almost always means a droplet/webmon problem, not the websites.\n    Select-String -Path /opt/webmon/webmon.log -Pattern 'fail|error' | Select-Object -Last 60\n\nWhile blind: if the outage will last more than a few hours, cover the gap manually — run an unlisted urlscan.io scan of the page periodically and compare the contacted domains with the baseline.",
+      "evidence": [
+        {
+          "id": "site",
+          "label": "Site / first_failure_utc",
+          "type": "text"
+        },
+        {
+          "id": "error",
+          "label": "last_error (verbatim)",
+          "type": "textarea"
+        },
+        {
+          "id": "others",
+          "label": "Other sites failing too?",
+          "type": "text"
+        }
+      ],
+      "next": "error-type?"
+    },
+    "error-type?": {
+      "type": "decision",
+      "title": "What does last_error indicate?",
+      "instructions": "- 'Load appears to have failed: no request to <domain> observed. Hosts seen: ...' — the site's own domain never loaded: a WEBSITE-side cause (down, DNS change, WAF/bot block, redirect).\n- 'No NetLog produced' or 'Browser could not be stopped cleanly / force-killed' — a MONITORING-HOST problem, not the website.\n- Multiple sites failing at once — treat as a monitoring-host problem first.\n- Anything else — start with the website checks, then the droplet.",
+      "options": [
+        {
+          "label": "Site's own domain never loaded (website-side)",
+          "next": "site-checks",
+          "note": "Check availability, DNS, WAF, TLS, redirects."
+        },
+        {
+          "label": "No NetLog / browser force-killed / many sites failing",
+          "next": "droplet-health",
+          "note": "Check the droplet."
+        },
+        {
+          "label": "Other / unclear",
+          "next": "site-checks",
+          "note": "Website first, then droplet."
+        }
+      ]
+    },
+    "site-checks": {
+      "type": "step",
+      "title": "Check the website side",
+      "instructions": "Work out why the site's own domain did not load. Run network checks from the droplet (it is the vantage point that failed) or an isolated host; DNS lookups are safe from a workstation.\n\n1) IS THE SITE DOWN? Ask the owner / check their status page; check from another vantage point (an unlisted urlscan.io scan of the page shows whether it loads from elsewhere and a screenshot).\n\n2) DID DNS CHANGE? (possible domain or DNS hijack) — compare current records with known-good values from the owner/registrar/DNS provider:\n    Resolve-DnsName <site> -Type A\n    Resolve-DnsName <site> -Type NS\n    Resolve-DnsName www.<site> -Type CNAME\n   (Resolve-DnsName is Windows PowerShell; on the Linux droplet use dig/host.) Also check passive DNS history in VirusTotal / Umbrella Investigate, and WHOIS for recent registrar, nameserver, or registrant changes. Unexplained NS or A changes are a potential compromise.\n\n3) IS A WAF / BOT PROTECTION BLOCKING THE DROPLET? Look at 'Hosts seen' in last_error for challenge infrastructure, e.g. challenges.cloudflare.com, hCaptcha / reCAPTCHA hosts, or bot-management vendors (DataDome, PerimeterX/HUMAN, Imperva, Akamai). Datacenter IPs like DigitalOcean's are frequently challenged. Fix with the owner: allow-list the droplet's IP/user-agent in the WAF, rather than changing webmon to evade it.\n\n4) TLS CERTIFICATE expired or changed? From pwsh:\n    $h='<site>'; $tcp=[Net.Sockets.TcpClient]::new($h,443)\n    $ssl=[Net.Security.SslStream]::new($tcp.GetStream(),$false,{$true}); $ssl.AuthenticateAsClient($h)\n    [Security.Cryptography.X509Certificates.X509Certificate2]$ssl.RemoteCertificate | Select-Object Subject, Issuer, NotBefore, NotAfter, Thumbprint\n    $ssl.Dispose(); $tcp.Dispose()\n   Compare with history on crt.sh (certificate transparency). An unexpected new certificate from an unusual issuer — especially alongside a DNS change — is a hijack signal.\n\n5) UNEXPECTED REDIRECT? Read the response without following redirects or running any page script (pwsh 7):\n    $r = Invoke-WebRequest -Uri 'https://<site>/' -MaximumRedirection 0 -SkipHttpErrorCheck -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'\n    $r.StatusCode; $r.Headers.Location\n   A redirect to an unrelated domain (parked page, TDS, scam/ad site) is treated as potential compromise.",
+      "evidence": [
+        {
+          "id": "up",
+          "label": "Site availability (owner / urlscan)",
+          "type": "text"
+        },
+        {
+          "id": "dns",
+          "label": "DNS A / NS / CNAME vs. known-good; WHOIS / passive DNS changes",
+          "type": "textarea"
+        },
+        {
+          "id": "waf",
+          "label": "WAF / challenge hosts in 'Hosts seen'",
+          "type": "text"
+        },
+        {
+          "id": "tls",
+          "label": "TLS certificate details vs. history",
+          "type": "textarea"
+        },
+        {
+          "id": "redirect",
+          "label": "Redirect status / location",
+          "type": "text"
+        }
+      ],
+      "next": "site-verdict?"
+    },
+    "site-verdict?": {
+      "type": "decision",
+      "title": "What is the website-side cause?",
+      "instructions": "An unexplained DNS/NS change, an unexpected certificate change tied to DNS changes, or a redirect to an unrelated domain is a potential compromise — escalate. Otherwise identify the operational cause.",
+      "options": [
+        {
+          "label": "Unexplained DNS/NS change, suspicious cert, or redirect to unrelated domain",
+          "next": "escalate-compromise",
+          "note": "Potential domain/site hijack."
+        },
+        {
+          "label": "Site outage or planned change (owner aware)",
+          "next": "close-resolved",
+          "note": "Wait for auto-resolve."
+        },
+        {
+          "label": "WAF / bot protection blocking the droplet",
+          "next": "close-resolved",
+          "note": "Fix allow-listing with the owner."
+        },
+        {
+          "label": "Website looks fine — suspect the droplet",
+          "next": "droplet-health",
+          "note": "Check the monitoring host."
+        }
+      ]
+    },
+    "droplet-health": {
+      "type": "step",
+      "title": "Check the monitoring host (droplet)",
+      "instructions": "'No NetLog produced' or 'browser force-killed' errors point to webmon or Chrome on the droplet. Run on the droplet (pwsh):\n\n- Disk space (NetLogs and logs fill disks):\n    Get-PSDrive -PSProvider FileSystem | Select-Object Name, Root, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}\n- Memory:\n    Get-Content /proc/meminfo | Select-Object -First 3\n- Stuck/zombie Chrome processes from earlier runs:\n    Get-Process | Where-Object Name -like '*chrom*' | Select-Object Id, Name, StartTime, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}}\n- Was Chrome auto-updated (a new version can break headless flags/NetLog)?\n    google-chrome --version\n    Select-String -Path /var/log/apt/history.log -Pattern 'google-chrome' -Context 1,3 | Select-Object -Last 5\n- webmon's own errors for the failing runs:\n    Get-Content /opt/webmon/webmon.log -Tail 200\n- Is the hourly cron job still running on schedule (run timestamps in webmon.log every hour)?\n\nFix the cause (free disk space, kill stale Chrome processes, pin or roll back Chrome, restart the droplet if needed), then watch the next run in webmon.log. If the failure turns out to be website-side after all, go back to the website checks.",
+      "evidence": [
+        {
+          "id": "disk",
+          "label": "Disk / memory status",
+          "type": "text"
+        },
+        {
+          "id": "chrome",
+          "label": "Chrome version / recent updates / stuck processes",
+          "type": "textarea"
+        },
+        {
+          "id": "log",
+          "label": "webmon.log errors and run schedule",
+          "type": "textarea"
+        },
+        {
+          "id": "fix",
+          "label": "Fix applied and next-run result",
+          "type": "textarea"
+        }
+      ],
+      "next": "close-resolved"
+    },
+    "escalate-compromise": {
+      "type": "terminal",
+      "title": "Escalate — possible domain/DNS hijack or site compromise",
+      "instructions": "The site is failing because its DNS, certificate, or redirect behavior changed in a way the owner cannot explain.\n\n- Notify IR and the site owner immediately; the owner should contact their registrar/DNS provider to lock the domain and restore records, and review registrar/DNS account access (MFA, recent logins, API keys).\n- Record current vs. known-good DNS records, certificate details, redirect target, and timestamps.\n- Enrich the new IPs / redirect domains (VirusTotal, urlscan, Shodan) and block them in Umbrella / Meraki / CrowdStrike / Defender if malicious.\n- Scope internal users who visited the site since first_failure_utc (Umbrella Activity Search) and hunt for ClickFix/download activity on their endpoints (see the ClickFix playbook).\n- When the site is restored, confirm webmon resumes and that no malicious hosts were auto-added to the baseline during recovery.",
+      "disposition": "escalated",
+      "playbook": "IR-HANDOFF",
+      "summary": "Site load failure caused by unexplained DNS/certificate/redirect change; potential hijack escalated to IR."
+    },
+    "close-resolved": {
+      "type": "terminal",
+      "title": "Close — resolved and cause understood",
+      "instructions": "Close ONLY when BOTH are true: the alert has auto-resolved (the site loaded successfully again) AND the cause is understood.\n\n- Record the cause (site outage, WAF block fixed by allow-listing, droplet disk/memory, Chrome update, etc.) and the fix.\n- Record the blind window (first_failure_utc -> recovery) and whether a manual urlscan check covered it.\n- After recovery, review the first successful run's new-host alerts with extra care: anything injected while the site was unmonitored will surface then.\n- If the cause was a WAF block or a Chrome change, note any webmon/infrastructure change made to prevent recurrence.",
+      "disposition": "closed",
+      "playbook": "TUNE-AND-CLOSE",
+      "summary": "Site load failure auto-resolved with cause identified (outage / WAF / droplet issue); blind window recorded and closed."
+    }
+  }
+}
